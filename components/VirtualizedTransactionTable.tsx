@@ -1,27 +1,48 @@
 "use client";
 
-import { useRef, type ReactNode } from "react";
+import { useRef, useEffect, useState, type ReactNode } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import type { Transaction } from "@/lib/types";
 import TransactionRow from "./TransactionRow";
+import { Table, TableBody, TableHead, TableHeaderCell } from "./Table";
+import { t } from "@/lib/i18n";
 
 const ROW_HEIGHT = 41;
 const OVERSCAN = 12;
-const th =
-  "text-left text-[11px] tracking-[0.06em] uppercase text-[#a6a3b0] px-3 py-2.5 border-b border-[#e5e3ea] bg-[#fafafa]";
+/** Number of columns in the desktop table: status dot + hash + ledger + source + ops + fee + time. */
+const COLUMNS = 7;
 
 export default function VirtualizedTransactionTable({
   transactions,
   emptyMessage,
   children,
+  initialScrollTop = 0,
+  onScrollTopChange,
 }: {
   transactions: Transaction[];
   emptyMessage: string | null;
   children: ReactNode;
+  /**
+   * Offset to restore once the rows are laid out. The virtualizer only renders
+   * the visible window, so restoring the offset before the spacer rows exist
+   * would be clamped to the top of a one-row list.
+   */
+  initialScrollTop?: number;
+  /** Reports the scroll offset so the parent can remember it. */
+  onScrollTopChange?: (scrollTop: number) => void;
 }) {
   // TanStack Virtual exposes mutable instance methods that cannot be memoized.
   // Keep that boundary here so filtering, fetching and presets remain eligible.
   "use no memo";
+
+  const [isMobile, setIsMobile] = useState(false);
+
+  useEffect(() => {
+    setIsMobile(window.innerWidth < 768);
+    const handleResize = () => setIsMobile(window.innerWidth < 768);
+    window.addEventListener('resize', handleResize);
+    return () => window.removeEventListener('resize', handleResize);
+  }, []);
 
   // ── Virtualization ──────────────────────────────────────────────────────
 
@@ -44,50 +65,104 @@ export default function VirtualizedTransactionTable({
       ? totalSize - virtualRows[virtualRows.length - 1].end
       : 0;
 
-  return (
-    <div
-      ref={scrollRef}
-      data-testid="transaction-scroll"
-      className="rounded-xl border border-[#e5e3ea] overflow-auto max-h-[70vh]"
-    >
-      <table className="w-full text-sm border-collapse">
-        <thead className="sticky top-0 z-10">
-          <tr>
-            <th className={`${th} w-6`} />
-            <th className={th}>Hash</th>
-            <th className={th}>Ledger</th>
-            <th className={th}>Source</th>
-            <th className={th}>Ops</th>
-            <th className={th}>Fee</th>
-            <th className={th}>Time</th>
-          </tr>
-        </thead>
-        <tbody>
-          {paddingTop > 0 && (
-            <tr aria-hidden="true">
-              <td colSpan={7} style={{ height: paddingTop }} />
-            </tr>
-          )}
-          {virtualRows.map((virtualRow) => (
-            <TransactionRow
-              key={transactions[virtualRow.index].hash}
-              tx={transactions[virtualRow.index]}
-            />
-          ))}
-          {paddingBottom > 0 && (
-            <tr aria-hidden="true">
-              <td colSpan={7} style={{ height: paddingBottom }} />
-            </tr>
-          )}
-        </tbody>
-      </table>
+  // Restore the reader's offset once, after the rows that give the container its
+  // full height are on screen. The ref keeps a scroll from re-applying an old
+  // offset on every re-render.
+  const restoredRef = useRef(false);
+  useEffect(() => {
+    if (restoredRef.current) return;
+    const element = scrollRef.current;
+    if (!element || initialScrollTop <= 0 || virtualRows.length === 0) return;
+    restoredRef.current = true;
+    element.scrollTop = initialScrollTop;
+  }, [initialScrollTop, virtualRows.length]);
 
-      {transactions.length === 0 && emptyMessage && (
-        <div className="p-8 text-center text-[#a6a3b0] text-sm">
-          {emptyMessage}
-        </div>
-      )}
-      {children}
-    </div>
+  if (isMobile && transactions.length > 0) {
+    return (
+      <div className="space-y-3">
+        {transactions.map((tx) => (
+          <div
+            key={tx.hash}
+            className="rounded-lg border border-[var(--color-border-default)] p-4 bg-[var(--color-bg-subtle)]"
+          >
+            <div className="flex justify-between items-start mb-2">
+              <span className="text-xs font-semibold text-[var(--color-text-muted)]">{t("table.hash")}</span>
+              <span className="mono text-xs text-[var(--color-text-primary)] font-semibold truncate ms-2">{tx.hash.slice(0, 12)}…</span>
+            </div>
+            <div className="flex justify-between items-start mb-2">
+              <span className="text-xs font-semibold text-[var(--color-text-muted)]">{t("table.ledger")}</span>
+              <span className="mono text-xs text-[var(--color-text-primary)]">{tx.ledger}</span>
+            </div>
+            <div className="flex justify-between items-start mb-2">
+              <span className="text-xs font-semibold text-[var(--color-text-muted)]">{t("table.source")}</span>
+              <span className="mono text-xs text-[var(--color-text-primary)] truncate ms-2">{tx.sourceAccount.slice(0, 12)}…</span>
+            </div>
+            </div>
+            <div className="flex justify-between items-start mb-2">
+              <span className="text-xs font-semibold text-[var(--color-text-muted)]">{t("table.operations")}</span>
+              <span className="mono text-xs text-[var(--color-text-primary)]">{tx.operationCount}</span>
+            </div>
+            <div className="flex justify-between items-start mb-2">
+              <span className="text-xs font-semibold text-[var(--color-text-muted)]">{t("table.fee")}</span>
+              <span className="mono text-xs text-[var(--color-text-primary)]">{tx.feeCharged}</span>
+            </div>
+            <div className="flex justify-between items-start">
+              <span className="text-xs font-semibold text-[var(--color-text-muted)]">{t("table.time")}</span>
+              <span className="text-xs text-[var(--color-text-primary)]">{new Date(tx.createdAt).toLocaleDateString()}</span>
+            </div>
+          </div>
+        ))}
+        {children}
+      </div>
+    );
+  }
+
+  return (
+    <Table
+      ref={scrollRef}
+      caption="Transactions"
+      columnCount={COLUMNS}
+      stickyHeader
+      containerClassName="rounded-xl border border-[var(--color-border-default)] overflow-auto max-h-[70vh]"
+      data-testid="transaction-scroll"
+      emptyMessage={
+        transactions.length === 0 && emptyMessage ? emptyMessage : undefined
+      }
+      afterTable={children}
+    >
+      <TableHead>
+        {/* A plain row: `TableRow`'s border belongs to body rows, and the
+            header cells already draw their own. */}
+        <tr>
+          <TableHeaderCell className="w-6" />
+          <TableHeaderCell>{t("table.hash")}</TableHeaderCell>
+          <TableHeaderCell>{t("table.ledger")}</TableHeaderCell>
+          <TableHeaderCell>{t("table.source")}</TableHeaderCell>
+          <TableHeaderCell>{t("table.ops")}</TableHeaderCell>
+          <TableHeaderCell>{t("table.fee")}</TableHeaderCell>
+          <TableHeaderCell>{t("table.time")}</TableHeaderCell>
+        </tr>
+      </TableHead>
+      <TableBody>
+        {paddingTop > 0 && (
+          // Layout, not data: kept as a bare cell so the inline height the
+          // virtualizer measures is not padded out by the shared cell styles.
+          <tr aria-hidden="true">
+            <td colSpan={COLUMNS} style={{ height: paddingTop }} />
+          </tr>
+        )}
+        {virtualRows.map((virtualRow) => (
+          <TransactionRow
+            key={transactions[virtualRow.index].hash}
+            tx={transactions[virtualRow.index]}
+          />
+        ))}
+        {paddingBottom > 0 && (
+          <tr aria-hidden="true">
+            <td colSpan={COLUMNS} style={{ height: paddingBottom }} />
+          </tr>
+        )}
+      </TableBody>
+    </Table>
   );
 }

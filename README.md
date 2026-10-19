@@ -31,6 +31,8 @@ Runs against `http://localhost:4000/graphql` by default — start [lumina-backen
 
 | `NEXT_PUBLIC_SITE_URL` | Canonical URLs, `og:image` and the sitemap — **build-time inlined** | `http://localhost:3000` |
 
+`NEXT_PUBLIC_VAPID_PUBLIC_KEY` enables the optional push notifications on `/watch`. It is unset by default and push stays off unless someone opts in — see [docs/PUSH_NOTIFICATIONS.md](docs/PUSH_NOTIFICATIONS.md) for the backend endpoint the delivery path still needs.
+
 `NEXT_PUBLIC_*` values must be set as Docker build `ARG`s (see `Dockerfile`), not runtime env vars — Next.js inlines them into the client bundle at build time, so setting them only at container-run time has no effect.
 
 `NEXT_PUBLIC_SITE_URL` is the one that has to be right in production. Every canonical link, share-card URL and sitemap entry is resolved against it at build time, so a site served from another origin while this still says `localhost` emits absolute URLs that point nowhere.
@@ -42,16 +44,18 @@ description and crawl policy — and everything else reads from it: the navbar,
 `sitemap.ts`, `robots.txt` and the per-route metadata. Adding a route means
 adding one entry there, not editing four files and hoping they agree.
 
-**Indexed.** The seven stable routes (`/`, `/explorer`, `/transactions`,
-`/events`, `/graphql`, `/registry`, `/stats`) are in `sitemap.xml` and each
-carries its own title, description, canonical URL and 1200×630 share card.
+**Indexed.** The eight stable routes (`/`, `/explorer`, `/transactions`,
+`/search`, `/events`, `/graphql`, `/registry`, `/stats`) are in `sitemap.xml`
+and each carries its own title, description, canonical URL and 1200×630 share
+card.
 
 **Crawl-blocked, still linkable.**
 
-| Path | Why |
-|---|---|
-| `/accounts/*` | One page per Stellar address, unbounded and unguessable, so there is no finite set for a crawler to walk. A link shared into a chat still previews correctly, because `/accounts/[address]` has its own `generateMetadata` and its own generated image. |
-| `/*?` | Filter and search views — `?status=failed`, `?contractId=…`. They are the same page as the route they filter, not separate pages, and each one declares the bare route as its canonical. |
+| Path              | Why                                                                                                                                                                                                                                                     |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `/accounts/*`     | One page per Stellar address, unbounded and unguessable, so there is no finite set for a crawler to walk. A link shared into a chat still previews correctly, because `/accounts/[address]` has its own `generateMetadata` and its own generated image. |
+| `/transactions/*` | One page per transaction hash, unbounded for the same reason. A shared link still previews correctly from the hash in the URL alone.                                                                                                                    |
+| `/*?`             | Filter and search views — `?status=failed`, `?contractId=…`, `?q=…`. They are the same page as the route they filter, not separate pages, and each one declares the bare route as its canonical.                                                        |
 
 `app/robots.ts` carries the reasoning inline, as a `reason` on each entry in
 `CRAWL_EXCLUDED`, so the next person to touch the policy can see why it is what
@@ -90,6 +94,31 @@ After the retry budget is exhausted, or where `WebSocket` is unavailable at all
 (a restrictive proxy, a server-rendered pass), the feed falls back to the
 original 30-second polling rather than going dead.
 
+## Watching accounts
+
+`/watch` is where several accounts are followed at once, and it is the reason the
+shared socket above is shared. A watch list of eight accounts means **one**
+`WebSocket` carrying eight multiplexed subscriptions, not eight connections — so
+the connection count does not grow with the list, and the server has one view of
+whether the tab is connected rather than eight disagreeing ones. Adding a watch
+sends one more subscription frame on the open socket; it does not reconnect.
+
+Each watch carries its own filter (`lib/filterModel.ts`), defaulting to payments
+so a quiet watch stays quiet. Filters are part of the watch, not the page, which
+is what lets one watch alert on large payments while another takes everything.
+
+New activity on a watch surfaces in two places. The `ActivityBell` in the navbar
+is the always-available one: it survives navigation and reloads, marks the count
+read when opened, and links through to the account. A system notification is
+raised only when the tab is actually in the background, and only after someone
+opts in by clicking — permission is never requested on page load. See
+[docs/PUSH_NOTIFICATIONS.md](docs/PUSH_NOTIFICATIONS.md) for the VAPID key and
+the backend endpoint that delivery still requires.
+
+`/watch` is deliberately excluded from the sitemap (`WATCHES.indexable = false`)
+so a per-person list never ends up indexed, while staying linked from the navbar
+for people who want it.
+
 ## Wallet-connected Registry page
 
 `/registry` lets a user register a contract on the Lumina Registry directly from the browser, via [@creit.tech/stellar-wallets-kit](https://github.com/Creit-Tech/Stellar-Wallets-Kit) (Freighter, xBull, Albedo, Rabet, and Lobstr are wired in — not locked to a single wallet). Connecting opens a wallet-picker modal; registering builds a `register_contract` invocation with `@stellar/stellar-sdk`, simulates it, has the chosen wallet sign it, and submits it via Soroban RPC. The "Recently Registered" list reads the live registry the same way — no wallet needed for that part.
@@ -102,11 +131,14 @@ components/     React components
 lib/            GraphQL client + formatters
 ```
 
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the server/client
+component split, the data-fetching patterns and the wallet/transaction pipeline.
+
 ## License
 
 MIT
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for staged-file checks, GraphQL type generation,
-and the one-command bundle analyzer.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, where new code goes, the staged-file
+checks, and what a pull request is expected to contain.

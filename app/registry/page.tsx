@@ -11,11 +11,20 @@ import {
   type Category,
   type RegistryProfile,
 } from "@/lib/registry";
-import { connectWallet, getConnectedAddress } from "@/lib/wallet";
+import {
+  checkNetworkMismatch,
+  connectWallet,
+  disconnectWallet,
+  getConnectedWallet,
+  readPersistedSession,
+  type WalletSession,
+} from "@/lib/wallet";
 import RegisterContractForm from "@/components/RegisterContractForm";
 import OwnerContracts from "@/components/OwnerContracts";
 import RegistryEntryCard from "@/components/RegistryEntryCard";
 import BackendUnavailable from "@/components/BackendUnavailable";
+import WalletInfo from "@/components/WalletInfo";
+import { Button } from "@/components/ui/Button";
 
 type Tab = "mine" | "all";
 
@@ -24,7 +33,7 @@ export default function RegistryPage() {
   return (
     <Suspense
       fallback={
-        <div className="p-8 text-center text-[#a6a3b0] text-sm">
+        <div className="p-8 text-center text-[var(--color-text-muted)] text-sm">
           Loading registry…
         </div>
       }
@@ -54,9 +63,19 @@ function RegistryContent() {
   const rawCategory = searchParams?.get("category");
   const category = isCategory(rawCategory) ? rawCategory : null;
 
-  const [walletAddress, setWalletAddress] = useState<string | null>(null);
+  // "resolving" prevents a flash of disconnected state on reload: we seed from
+  // localStorage synchronously so the UI knows a session likely exists before
+  // the async getConnectedWallet() call confirms it (#86).
+  const persisted = typeof window !== "undefined" ? readPersistedSession() : null;
+  const [wallet, setWallet] = useState<WalletSession | null>(null);
+  const [walletResolving, setWalletResolving] = useState(persisted !== null);
   const [connecting, setConnecting] = useState(false);
+  const [disconnecting, setDisconnecting] = useState(false);
   const [connectError, setConnectError] = useState<string | null>(null);
+  const [walletLocked, setWalletLocked] = useState(false);
+
+  // Convenience: address is still used in several places below.
+  const walletAddress = wallet?.address ?? null;
 
   const [entries, setEntries] = useState<RegistryProfile[]>([]);
   const [entriesLoading, setEntriesLoading] = useState(true);
@@ -108,12 +127,18 @@ function RegistryContent() {
   }, [loadEntries]);
 
   useEffect(() => {
+    // No persisted session means there is nothing to confirm — and confirming
+    // is what would pull the wallet kit in. Skipping it keeps the kit out of
+    // the browser entirely for a visitor who never connects.
+    if (!readPersistedSession()) return;
+
     let cancelled = false;
 
-    getConnectedAddress().then((address) => {
+    getConnectedWallet().then((session) => {
       if (cancelled) return;
-      setWalletAddress(address);
-      if (address) setTab("mine");
+      setWallet(session);
+      if (session) setTab("mine");
+      setWalletResolving(false);
     });
 
     return () => {
@@ -132,14 +157,39 @@ function RegistryContent() {
   async function handleConnect() {
     setConnecting(true);
     setConnectError(null);
+    setWalletLocked(false);
     const result = await connectWallet();
     if ("error" in result) {
       setConnectError(result.error);
+      setWalletLocked(result.isLocked ?? false);
     } else {
-      setWalletAddress(result.address);
-      setTab("mine");
+      // Check for network mismatch after successful connection
+      const mismatch = await checkNetworkMismatch();
+      if (mismatch) {
+        setConnectError(mismatch.error);
+        // Still set the wallet session so user can see their wallet info
+        const session = await getConnectedWallet();
+        setWallet(session);
+      } else {
+        // Re-fetch full session so we get name + icon too (#88).
+        const session = await getConnectedWallet();
+        setWallet(session);
+        setTab("mine");
+        setWalletLocked(false);
+      }
     }
     setConnecting(false);
+  }
+
+  async function handleDisconnect() {
+    setDisconnecting(true);
+    try {
+      await disconnectWallet();
+    } finally {
+      setWallet(null);
+      setTab("all");
+      setDisconnecting(false);
+    }
   }
 
   function handleRegistered() {
@@ -149,47 +199,75 @@ function RegistryContent() {
 
   return (
     <div className="max-w-[1160px] mx-auto px-4 sm:px-7 py-12">
-      <h1 className="font-extrabold text-3xl mb-2 text-[#0e0e12]">
+      <h1 className="font-extrabold text-3xl mb-2 text-[var(--color-text-primary)]">
         Lumina Registry
       </h1>
-      <p className="text-[#6b6975] mb-8 max-w-[70ch]">
+      <p className="text-[var(--color-text-secondary)] mb-8 max-w-[70ch]">
         An on-chain Soroban manifest of contracts Lumina indexes. Register your
         contract to opt into priority indexing — permissionless, on
         Stellar/Soroban testnet.
       </p>
 
       <div className="grid grid-cols-1 lg:grid-cols-[1fr_1.2fr] gap-8 items-start">
-        <div className="border border-[#e5e3ea] rounded-2xl p-6 bg-[#fafafa]">
-          <h2 className="font-extrabold text-base mb-[18px] text-[#0e0e12]">
+        <div className="border border-[var(--color-border-default)] rounded-2xl p-6 bg-[var(--color-bg-subtle)]">
+          <h2 className="font-extrabold text-base mb-[18px] text-[var(--color-text-primary)]">
             Register a Contract
           </h2>
 
-          {!walletAddress ? (
+          {walletResolving ? (
+            <p className="text-[13px] text-[var(--color-text-muted)]">Connecting…</p>
+          ) : !walletAddress ? (
             <div className="flex flex-col gap-3">
-              <p className="text-[13px] text-[#6b6975]">
+              <p className="text-[13px] text-[var(--color-text-secondary)]">
                 Connect a wallet to register and manage contracts.
               </p>
-              <button
+              <Button
+                variant="primary"
+                size="md"
+                loading={connecting}
+                loadingText="Connecting…"
                 onClick={handleConnect}
-                disabled={connecting}
-                className="bg-[#8b5cf6] hover:bg-[#7c3aed] disabled:opacity-50 text-white font-bold text-sm py-3 rounded-lg transition-colors"
+                className="w-full"
               >
-                {connecting ? "Connecting…" : "Connect Wallet"}
-              </button>
+                Connect Wallet
+              </Button>
               {connectError && (
                 <div
                   role="alert"
-                  className="text-xs text-[#dc2626] bg-[#fef2f2] rounded-lg px-3 py-2"
+                  className="text-xs text-[var(--color-error-text)] bg-[var(--color-error-bg)] rounded-lg px-3 py-2"
                 >
-                  {connectError}
+                  {walletLocked ? (
+                    <div>
+                      <p className="font-semibold mb-1">Your wallet is locked</p>
+                      <p className="text-[var(--color-error-dark)]">Unlock your wallet extension and try again.</p>
+                    </div>
+                  ) : connectError.includes('Network mismatch') ? (
+                    <div>
+                      <p className="font-semibold mb-1">Network Mismatch</p>
+                      <p className="text-[var(--color-error-dark)]">
+                        {connectError}
+                      </p>
+                    </div>
+                  ) : (
+                    connectError
+                  )}
                 </div>
               )}
             </div>
           ) : (
-            <RegisterContractForm
-              walletAddress={walletAddress}
-              onRegistered={handleRegistered}
-            />
+            <div className="flex flex-col gap-3">
+              <WalletInfo
+                address={wallet!.address}
+                walletName={wallet!.walletName}
+                walletIcon={wallet!.walletIcon}
+                onDisconnect={handleDisconnect}
+                disconnecting={disconnecting}
+              />
+              <RegisterContractForm
+                walletAddress={walletAddress}
+                onRegistered={handleRegistered}
+              />
+            </div>
           )}
         </div>
 
@@ -239,16 +317,16 @@ function RegistryContent() {
                 onChanged={loadEntries}
               />
             ) : (
-              <p className="text-sm text-[#a6a3b0]">
+              <p className="text-sm text-[var(--color-text-muted)]">
                 Connect a wallet to see the contracts you registered.
               </p>
             )
           ) : entriesLoading ? (
-            <p className="text-sm text-[#a6a3b0]">Loading registry entries…</p>
+            <p className="text-sm text-[var(--color-text-muted)]">Loading registry entries…</p>
           ) : entriesError ? (
             <BackendUnavailable onRetry={loadEntries} />
           ) : entries.length === 0 ? (
-            <p className="text-sm text-[#a6a3b0]">
+            <p className="text-sm text-[var(--color-text-muted)]">
               {category
                 ? `No active ${CATEGORY_LABELS[category]} contracts.`
                 : "No contracts registered yet."}
@@ -285,8 +363,8 @@ function TabButton({
       onClick={onClick}
       className={`text-sm font-extrabold px-3 py-1.5 rounded-lg transition-colors disabled:opacity-40 ${
         active
-          ? "bg-[#f5f3ff] text-[#7c3aed]"
-          : "text-[#6b6975] hover:text-[#0e0e12]"
+          ? "bg-[var(--color-accent-surface)] text-[var(--color-accent-text)]"
+          : "text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)]"
       }`}
     >
       {children}
@@ -309,8 +387,8 @@ function CategoryChip({
       onClick={onClick}
       className={`text-xs font-bold px-2.5 py-1 rounded-full border transition-colors ${
         active
-          ? "bg-[#f5f3ff] border-[#8b5cf6] text-[#7c3aed]"
-          : "border-[#e5e3ea] text-[#6b6975] hover:text-[#0e0e12]"
+          ? "bg-[var(--color-accent-surface)] border-[var(--color-accent-fill)] text-[var(--color-accent-text)]"
+          : "border-[var(--color-border-default)] text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)]"
       }`}
     >
       {children}

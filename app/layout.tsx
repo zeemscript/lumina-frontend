@@ -1,22 +1,27 @@
 import type { Metadata } from "next";
-import { Inter, JetBrains_Mono } from "next/font/google";
+import localFont from "next/font/local";
 import "./globals.css";
 import Footer from "@/components/Footer";
 import Navbar from "@/components/Navbar";
-import Footer from "@/components/Footer";
+import SkipLink from "@/components/SkipLink";
+import DirectionSync from "@/components/DirectionSync";
 import KeyboardShortcuts from "@/components/KeyboardShortcuts";
+import ThemeScript from "@/components/ThemeScript";
+import WatchActivityWatcher from "@/components/WatchActivityWatcher";
 import { shareCard } from "@/lib/metadata";
 import { DEFAULT_DESCRIPTION, SITE_NAME, SITE_TITLE, SITE_URL } from "@/lib/site";
 
-const inter = Inter({
+const inter = localFont({
+  src: "./fonts/inter-latin.woff2",
   variable: "--font-inter",
-  subsets: ["latin"],
-  weight: ["400", "500", "600", "700", "800"],
+  weight: "100 900",
+  display: "swap",
 });
-const jetbrainsMono = JetBrains_Mono({
+const jetbrainsMono = localFont({
+  src: "./fonts/jetbrains-mono-latin.woff2",
   variable: "--font-jetbrains-mono",
-  subsets: ["latin"],
-  weight: ["400", "500", "600"],
+  weight: "100 800",
+  display: "swap",
 });
 
 export const metadata: Metadata = {
@@ -49,12 +54,20 @@ export default function RootLayout({
       lang="en"
       className={`${inter.variable} ${jetbrainsMono.variable} h-full antialiased`}
     >
-      <body className="min-h-full flex flex-col bg-white text-[#0e0e12]">
+      <head>
+        <ThemeScript />
+      </head>
+      <body className="min-h-full flex flex-col bg-[var(--color-bg-base)] text-[var(--color-text-primary)]">
+        <DirectionSync />
+        <SkipLink />
+        {/* Alerts for watched addresses have to keep arriving on every route,
+            which is the whole point of a watch. It subscribes and records; it
+            renders nothing. */}
+        <WatchActivityWatcher />
         <Navbar />
         <KeyboardShortcuts />
-        <main className="flex-1">{children}</main>
+        <main id="main" className="flex-1">{children}</main>
         <Footer />
-        <KeyboardShortcuts />
       </body>
     </html>
   );

@@ -1,4 +1,5 @@
 import Link from "next/link";
+import { t } from "@/lib/i18n";
 
 const NAV_LINKS = [
   { href: "/explorer", label: "Explorer" },
@@ -12,27 +13,27 @@ const NAV_LINKS = [
 export default function NotFound() {
   return (
     <div className="max-w-lg mx-auto px-6 py-24 text-center">
-      <p className="text-5xl font-extrabold text-[#8b5cf6] mb-4">404</p>
-      <p className="text-lg font-semibold text-[#0e0e12] mb-2">Page not found</p>
-      <p className="text-sm text-[#6b6975] mb-8">
-        That address, hash, or route doesn&apos;t exist. Double-check the URL or use the Explorer to look up an account or transaction.
+      <p className="text-5xl font-extrabold text-[var(--color-accent-text)] mb-4">{t("notFound.code")}</p>
+      <p className="text-lg font-semibold text-[var(--color-text-primary)] mb-2">{t("notFound.title")}</p>
+      <p className="text-sm text-[var(--color-text-secondary)] mb-8">
+        {t("notFound.body")}
       </p>
 
       <Link
         href="/explorer"
-        className="inline-block px-5 py-2.5 bg-[#8b5cf6] hover:bg-[#7c3aed] text-white rounded-lg text-sm font-semibold transition-colors mb-10"
+        className="inline-block px-5 py-2.5 bg-[var(--color-accent-fill)] hover:bg-[var(--color-accent-fill-hover)] text-white rounded-lg text-sm font-semibold transition-colors mb-10"
       >
-        Open Explorer
+        {t("notFound.openExplorer")}
       </Link>
 
-      <div className="border-t border-[#e5e3ea] pt-8">
-        <p className="text-xs text-[#c3c1cb] uppercase tracking-widest mb-4">Or go to</p>
+      <div className="border-t border-[var(--color-border-default)] pt-8">
+        <p className="text-xs text-[var(--color-text-faint)] uppercase tracking-widest mb-4">{t("notFound.orGoTo")}</p>
         <div className="flex flex-wrap justify-center gap-2">
           {NAV_LINKS.map(link => (
             <Link
               key={link.href}
               href={link.href}
-              className="px-3.5 py-2 text-[13.5px] font-semibold rounded-lg text-[#6b6975] hover:text-[#0e0e12] bg-[#f6f5f8] transition-colors"
+              className="px-3.5 py-2 text-[13.5px] font-semibold rounded-lg text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)] bg-[var(--color-bg-raised)] transition-colors"
             >
               {link.label}
             </Link>
