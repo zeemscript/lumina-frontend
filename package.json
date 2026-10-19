@@ -11,9 +11,12 @@
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
     "test:e2e": "playwright test",
-    "codegen": "graphql-codegen --config codegen.ts",
+    "codegen": "node scripts/gen-palette.mjs && graphql-codegen --config codegen.ts",
     "prebuild": "npm run codegen",
     "analyze": "node scripts/analyze.mjs",
+    "build:bundle": "next build --experimental-build-mode compile",
+    "bundle:report": "node scripts/bundle-report.mjs",
+    "bundle:update": "npm run build:bundle && node scripts/bundle-report.mjs --update",
     "prepare": "node scripts/prepare.mjs",
     "lint:staged": "lint-staged",
     "measure:compiler": "node scripts/measure-compiler.mjs"
@@ -26,9 +29,11 @@
     "lucide-react": "^1.16.0",
     "next": "16.2.6",
     "react": "19.2.4",
-    "react-dom": "19.2.4"
+    "react-dom": "19.2.4",
+    "recharts": "^2.15.4"
   },
   "devDependencies": {
+    "@axe-core/playwright": "^4.13.0",
     "@babel/core": "^7.29.7",
     "@babel/preset-typescript": "^7.29.7",
     "@graphql-codegen/cli": "^6.3.1",

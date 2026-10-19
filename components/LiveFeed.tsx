@@ -7,11 +7,15 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { Pause, Play } from "lucide-react";
 import { gqlFetch, PUBLIC_GRAPHQL_URL } from "@/lib/graphql";
+import { useAbortScope } from "@/lib/useAbortScope";
 import { useSubscription } from "@/lib/useSubscription";
 import type { Transaction } from "@/lib/types";
 import { truncateAddress } from "@/lib/formatters";
 import TimeAgo from "./TimeAgo";
 import ConnectionIndicator from "./ConnectionIndicator";
+import { t } from "@/lib/i18n";
+import { EmptyState } from "@/components/ui/EmptyState";
+import { InlineLoading } from "@/components/ui/InlineLoading";
 
 /**
  * How many transactions the feed keeps.
@@ -23,6 +27,9 @@ export const MAX_FEED_LENGTH = 25;
 
 /** Interval used only when the live connection is unavailable. */
 export const FALLBACK_POLL_MS = 30_000;
+
+/** Minimum interval between live-region announcements (ms). */
+const ANNOUNCE_THROTTLE_MS = 5_000;
 
 /** The initial page, so the feed is not empty until the first push arrives. */
 const SEED_LIMIT = 10;
@@ -36,14 +43,47 @@ export default function LiveFeed() {
   const [paused, setPaused] = useState(false);
   const [pendingCount, setPendingCount] = useState(0);
   const [resumedCount, setResumedCount] = useState(0);
+  const [announcement, setAnnouncement] = useState("");
   const pausedRef = useRef(false);
   const txsRef = useRef<Transaction[]>([]);
   const queuedRef = useRef<Transaction[]>([]);
   const seenWhilePausedRef = useRef(new Set<string>());
+  const lastAnnounceRef = useRef(0);
+  const pendingAnnounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     txsRef.current = txs;
   }, [txs]);
+
+  // Throttled announcement helper
+  const announce = useCallback((message: string) => {
+    const now = Date.now();
+    const elapsed = now - lastAnnounceRef.current;
+
+    if (pendingAnnounceRef.current !== null) {
+      clearTimeout(pendingAnnounceRef.current);
+      pendingAnnounceRef.current = null;
+    }
+
+    if (elapsed >= ANNOUNCE_THROTTLE_MS) {
+      lastAnnounceRef.current = now;
+      setAnnouncement(message);
+    } else {
+      pendingAnnounceRef.current = setTimeout(() => {
+        lastAnnounceRef.current = Date.now();
+        pendingAnnounceRef.current = null;
+        setAnnouncement(message);
+      }, ANNOUNCE_THROTTLE_MS - elapsed);
+    }
+  }, []);
+
+  useEffect(
+    () => () => {
+      if (pendingAnnounceRef.current !== null)
+        clearTimeout(pendingAnnounceRef.current);
+    },
+    [],
+  );
 
   const pauseFeed = useCallback(() => {
     pausedRef.current = true;
@@ -62,10 +102,14 @@ export default function LiveFeed() {
     setPendingCount(0);
     setResumedCount(arrived);
 
+    // The visible banner announces this to sighted users; the live region
+    // on the banner (role="status") handles screen readers, so we don't
+    // duplicate the text in the sr-only live region.
+
     if (queued.length === 0) return;
-    setTxs(current => {
+    setTxs((current) => {
       const seen = new Set<string>();
-      const merged = [...queued, ...current].filter(tx => {
+      const merged = [...queued, ...current].filter((tx) => {
         if (seen.has(tx.hash)) return false;
         seen.add(tx.hash);
         return true;
@@ -75,15 +119,29 @@ export default function LiveFeed() {
     setLastUpdated(new Date());
   }, [pendingCount]);
 
-  const prependTransaction = useCallback((tx: Transaction) => {
-    setTxs((current) => {
-      // The server may replay an item across a reconnect; a hash already at the
-      // top must not appear twice.
-      if (current.some((existing) => existing.hash === tx.hash)) return current;
-      return [tx, ...current].slice(0, MAX_FEED_LENGTH);
-    });
-    setLastUpdated(new Date());
-  }, []);
+  const prependTransaction = useCallback(
+    (tx: Transaction) => {
+      if (pausedRef.current) {
+        if (seenWhilePausedRef.current.has(tx.hash)) return;
+        seenWhilePausedRef.current.add(tx.hash);
+        queuedRef.current = [tx, ...queuedRef.current].slice(
+          0,
+          MAX_FEED_LENGTH,
+        );
+        setPendingCount((count) => count + 1);
+        return;
+      }
+
+      setTxs((current) => {
+        if (current.some((existing) => existing.hash === tx.hash))
+          return current;
+        return [tx, ...current].slice(0, MAX_FEED_LENGTH);
+      });
+      setLastUpdated(new Date());
+      announce(t("liveFeed.newTransactions", { count: 1 }));
+    },
+    [announce],
+  );
 
   const { state, failureReason, retry } = useSubscription(
     NEW_TRANSACTION_SUBSCRIPTION,
@@ -99,14 +157,18 @@ export default function LiveFeed() {
   const live =
     state === "connected" || state === "connecting" || state === "reconnecting";
 
+  const scope = useAbortScope();
+
   const fetchRecent = useCallback(async () => {
+    const req = scope.next();
     try {
       const data = await gqlFetch(
         PUBLIC_GRAPHQL_URL,
         RECENT_TRANSACTIONS_QUERY,
         { limit: SEED_LIMIT },
+        { signal: req.signal },
       );
-      if (data.transactions.items.length > 0) {
+      if (req.isCurrent() && data.transactions.items.length > 0) {
         setTxs(data.transactions.items.slice(0, MAX_FEED_LENGTH));
         setLastUpdated(new Date());
       }
@@ -114,10 +176,8 @@ export default function LiveFeed() {
       // Keep showing the last successful fetch rather than blanking the panel.
     }
     setLoading(false);
-  }, []);
+  }, [scope]);
 
-  // Seed once on mount. Without this the feed is empty until the network
-  // happens to produce a transaction, which reads as broken.
   const seeded = useRef(false);
   useEffect(() => {
     if (seeded.current) return;
@@ -126,21 +186,29 @@ export default function LiveFeed() {
   }, [fetchRecent]);
 
   useEffect(() => {
-    const reconnect = () => { void fetchRecent(); retry(); };
+    const reconnect = () => {
+      void fetchRecent();
+      retry();
+    };
     window.addEventListener("lumina:online", reconnect);
     return () => window.removeEventListener("lumina:online", reconnect);
   }, [fetchRecent, retry]);
 
-  // Fall back to the old polling behaviour only once the client has actually
-  // given up — a restrictive proxy or a browser without WebSocket should
-  // degrade to a slower feed, not to a dead one.
   useEffect(() => {
     if (live) return;
     const interval = setInterval(() => void fetchRecent(), FALLBACK_POLL_MS);
     return () => clearInterval(interval);
   }, [live, fetchRecent]);
 
+  // Auto-pause when a row inside the feed receives focus, so the list doesn't
+  // shift under a keyboard or screen-reader user.
+  const feedRef = useRef<HTMLDivElement | null>(null);
+  const handleFocusIn = useCallback(() => {
+    if (!pausedRef.current) pauseFeed();
+  }, [pauseFeed]);
+
   const scrollRef = useRef<HTMLDivElement | null>(null);
+  // eslint-disable-next-line react-hooks/incompatible-library -- mutable API is confined to this component
   const virtualizer = useVirtualizer({
     count: txs.length,
     getScrollElement: () => scrollRef.current,
@@ -148,53 +216,144 @@ export default function LiveFeed() {
     overscan: OVERSCAN,
   });
   const virtualRows = virtualizer.getVirtualItems();
+  const totalSize = virtualizer.getTotalSize();
+  const paddingTop = virtualRows.length > 0 ? virtualRows[0].start : 0;
+  const paddingBottom =
+    virtualRows.length > 0
+      ? totalSize - virtualRows[virtualRows.length - 1].end
+      : 0;
+
+  const pauseLabel = paused
+    ? pendingCount > 0
+      ? t("liveFeed.resumeFeedCount", { count: pendingCount })
+      : t("liveFeed.resumeFeed")
+    : t("liveFeed.pauseFeed");
 
   return (
-    <div className="rounded-xl border border-[#e5e3ea] overflow-hidden">
-      <div className="flex items-center justify-between px-4 py-3 border-b border-[#e5e3ea] bg-[#fafafa]">
+    <div className="rounded-xl border border-[var(--color-border-default)] overflow-hidden">
+      <div className="flex items-center justify-between px-4 py-3 border-b border-[var(--color-border-default)] bg-[var(--color-bg-subtle)]">
         <ConnectionIndicator
           state={state}
           failureReason={failureReason}
           onRetry={retry}
         />
-        {lastUpdated && (
-          <span className="text-[11px] text-[#a6a3b0]">Updated <TimeAgo isoString={lastUpdated.toISOString()} /></span>
-        )}
+        <div className="flex items-center gap-2">
+          {!loading && txs.length > 0 && (
+            <button
+              type="button"
+              onClick={paused ? resumeFeed : pauseFeed}
+              aria-label={pauseLabel}
+              aria-pressed={paused || undefined}
+              className="inline-flex items-center gap-1 text-[11px] font-semibold text-[var(--color-text-muted)] hover:text-[var(--color-text-secondary)] transition-colors px-1.5 py-1 rounded"
+            >
+              {paused ? <Play size={12} /> : <Pause size={12} />}
+            </button>
+          )}
+          {lastUpdated && (
+            <span className="text-[11px] text-[var(--color-text-muted)]">
+              Updated <TimeAgo isoString={lastUpdated.toISOString()} />
+            </span>
+          )}
+        </div>
       </div>
 
-      {loading ? (
-        <div className="p-6 text-center text-[#a6a3b0] text-sm animate-pulse">
-          Fetching live data...
-        </div>
-      ) : txs.length === 0 ? (
-        <div className="p-6 text-center text-[#a6a3b0] text-sm">
-          No transactions found.
-        </div>
-      ) : (
-        <div>
-          {txs.map((tx) => (
-            <div
-              key={tx.hash}
-              className="flex items-center gap-3 px-4 py-2.5 border-b border-[#f0eff3] last:border-0"
-            >
-              <span
-                className={`w-[7px] h-[7px] rounded-full shrink-0 ${tx.successful ? "bg-[#16a34a]" : "bg-[#dc2626]"}`}
-              />
-              <a
-                href={`https://stellar.expert/explorer/public/tx/${tx.hash}`}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="mono text-xs text-[#7c3aed] hover:text-[#6d28d9] hover:underline transition-colors"
-              >
-                {truncateAddress(tx.hash, 5)}
-              </a>
-              <span className="text-xs text-[#a6a3b0] mono">{truncateAddress(tx.sourceAccount)}</span>
-              <span className="ml-auto text-[11px] text-[#c3c1cb]"><TimeAgo isoString={tx.createdAt} /></span>
-              <span className="text-[11px] bg-[#f6f5f8] text-[#6b6975] px-1.5 py-0.5 rounded">{tx.operationCount} ops</span>
-            </div>
-          ))}
+      {paused && pendingCount > 0 && (
+        <div
+          role="status"
+          className="px-4 py-2 text-[11px] font-semibold text-[var(--color-accent-text)] bg-[var(--color-accent-surface)] border-b border-[var(--color-border-default)]"
+        >
+          {t("liveFeed.updatesWaiting", { count: pendingCount })}
         </div>
       )}
+
+      {resumedCount > 0 && !paused && (
+        <div
+          role="status"
+          className="px-4 py-2 text-[11px] font-semibold text-[var(--color-accent-text)] bg-[var(--color-accent-surface)] border-b border-[var(--color-border-default)]"
+        >
+          {t("liveFeed.updatesArrived", { count: resumedCount })}
+        </div>
+      )}
+
+      {loading ? (
+        <InlineLoading label="Fetching live data" className="p-6 text-center" />
+      ) : txs.length === 0 ? (
+        <EmptyState
+          variant="inline"
+          title="No transactions yet"
+          description="New transactions will appear here as the network processes them."
+          className="p-6 text-center"
+        />
+      ) : (
+        <div
+          ref={scrollRef}
+          data-testid="live-feed-scroll"
+          data-retained-count={txs.length}
+          className="overflow-auto"
+          style={{ maxHeight: ROW_HEIGHT * 8 }}
+        >
+          <div
+            ref={feedRef}
+            role="list"
+            aria-label="Live transaction feed"
+            onFocusCapture={handleFocusIn}
+            style={{ height: totalSize, position: "relative" }}
+          >
+            {paddingTop > 0 && (
+              <div aria-hidden="true" style={{ height: paddingTop }} />
+            )}
+            {virtualRows.map((virtualRow) => {
+              const tx = txs[virtualRow.index];
+              return (
+                <div
+                  key={tx.hash}
+                  role="listitem"
+                  className="flex items-center gap-3 px-4 py-2.5 border-b border-[var(--color-bg-overlay)] last:border-0"
+                  style={{
+                    position: "absolute",
+                    top: 0,
+                    left: 0,
+                    width: "100%",
+                    height: virtualRow.size,
+                    transform: `translateY(${virtualRow.start}px)`,
+                  }}
+                >
+                  <span
+                    aria-hidden="true"
+                    className={`w-[7px] h-[7px] rounded-full shrink-0 ${tx.successful ? "bg-[var(--color-success-text)]" : "bg-[var(--color-error-text)]"}`}
+                  />
+                  <a
+                    href={`https://stellar.expert/explorer/public/tx/${tx.hash}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    aria-label={`Transaction ${truncateAddress(tx.hash, 5)}, ${tx.successful ? "successful" : "failed"}`}
+                    className="mono text-xs text-[var(--color-accent-text)] hover:text-[var(--color-accent-text-hover)] hover:underline transition-colors"
+                  >
+                    {truncateAddress(tx.hash, 5)}
+                  </a>
+                  <span className="text-xs text-[var(--color-text-muted)] mono">
+                    {truncateAddress(tx.sourceAccount)}
+                  </span>
+                  <span className="ml-auto text-[11px] text-[var(--color-text-faint)]">
+                    <TimeAgo isoString={tx.createdAt} />
+                  </span>
+                  <span className="text-[11px] bg-[var(--color-bg-raised)] text-[var(--color-text-secondary)] px-1.5 py-0.5 rounded">
+                    {tx.operationCount} ops
+                  </span>
+                </div>
+              );
+            })}
+            {paddingBottom > 0 && (
+              <div aria-hidden="true" style={{ height: paddingBottom }} />
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Polite live region — announced content is throttled so it does not flood */}
+      <div aria-live="polite" aria-atomic="true" className="sr-only">
+        {announcement}
+      </div>
     </div>
   );
 }

@@ -59,8 +59,8 @@ query AccountDetail($address: String!) {
   }
 }
 
-query ContractEvents($contractId: String!, $limit: Int) {
-  events(contractId: $contractId, limit: $limit) {
+query ContractEvents($contractId: String!, $limit: Int, $cursor: String) {
+  events(contractId: $contractId, limit: $limit, cursor: $cursor) {
     items {
       id
       type
@@ -71,6 +71,7 @@ query ContractEvents($contractId: String!, $limit: Int) {
       topics
       value
     }
+    pageInfo { hasNextPage cursor }
   }
 }
 
@@ -102,6 +103,46 @@ query TransactionPage($limit: Int, $cursor: String) {
     pageInfo {
       hasNextPage
       cursor
+    }
+  }
+}
+
+query MemoSearch($query: String!) {
+  search(query: $query, limit: 20) {
+    items {
+      hash
+      ledger
+      createdAt
+      sourceAccount
+      feeCharged
+      operationCount
+      successful
+      memoType
+      memo
+    }
+  }
+}
+
+query TransactionDetail($hash: String!) {
+  transaction(hash: $hash) {
+    hash
+    ledger
+    createdAt
+    sourceAccount
+    feeCharged
+    operationCount
+    successful
+    memoType
+    memo
+    operations {
+      id
+      type
+      createdAt
+      sourceAccount
+      from
+      to
+      amount
+      asset
     }
   }
 }
@@ -210,5 +251,85 @@ subscription AccountActivity($address: String!) {
     price
     selling
     buying
+  }
+}
+
+# The list half of the asset browser (#52). Deliberately does not select
+# `series`: that is the expensive part of AssetDetail and a list of twenty of
+# them is an aggregation nobody asked for. The detail query has it.
+query Assets($sortBy: AssetSort, $limit: Int, $cursor: String) {
+  assets(sortBy: $sortBy, limit: $limit, cursor: $cursor) {
+    items {
+      asset
+      code
+      issuer
+      native
+      supply
+      holders
+    }
+    pageInfo {
+      hasNextPage
+      cursor
+    }
+  }
+}
+
+# Per-asset transfer volume series used by the portfolio section of the account
+# page. `bucketSeconds` defaults to 86400 (daily) server-side; omitting it
+# here keeps the operation flexible for future range selectors.
+query AssetVolume($asset: String!, $from: String, $to: String, $bucketSeconds: Int) {
+  asset(asset: $asset, from: $from, to: $to, bucketSeconds: $bucketSeconds) {
+    asset
+    code
+    native
+    series {
+      bucketStart
+      volume
+      operationCount
+    }
+  }
+}
+
+query AccountTrustlineOps($address: String!, $limit: Int, $cursor: String) {
+  operations(account: $address, type: CHANGE_TRUST, limit: $limit, cursor: $cursor) {
+    items {
+      id
+      type
+      createdAt
+      transactionHash
+      sourceAccount
+      asset
+      amount
+    }
+    pageInfo {
+      hasNextPage
+      cursor
+    }
+  }
+}
+
+query ContractStorageEntries($contractId: String!, $keyPrefix: String, $durability: String, $limit: Int, $cursor: String) {
+  contractStorageEntries(contractId: $contractId, keyPrefix: $keyPrefix, durability: $durability, limit: $limit, cursor: $cursor) {
+    items {
+      key
+      durability
+      value
+      lastModifiedLedger
+      expiration
+    }
+    pageInfo {
+      hasNextPage
+      cursor
+    }
+  }
+}
+
+query ContractStorageKeyHistory($contractId: String!, $key: String!) {
+  contractStorageKeyHistory(contractId: $contractId, key: $key) {
+    items {
+      value
+      ledger
+      createdAt
+    }
   }
 }

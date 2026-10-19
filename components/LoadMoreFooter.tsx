@@ -4,6 +4,9 @@
  * lists on one page do not end up with two opinions about what "more" looks
  * like.
  */
+import { Button } from "@/components/ui/Button";
+import { t } from "@/lib/i18n";
+
 export interface LoadMoreFooterProps {
   loading: boolean;
   error: string | null;
@@ -13,17 +16,20 @@ export interface LoadMoreFooterProps {
   onLoadMore: () => void;
 }
 
-export default function LoadMoreFooter({ loading, error, hasMore, endLabel, onLoadMore }: LoadMoreFooterProps) {
+export default function LoadMoreFooter({
+  loading,
+  error,
+  hasMore,
+  endLabel,
+  onLoadMore,
+}: LoadMoreFooterProps) {
   if (error) {
     return (
       <div className="flex items-center justify-center gap-3 mt-4">
-        <span className="text-[13px] text-[#dc2626]">{error}</span>
-        <button
-          onClick={onLoadMore}
-          className="bg-[#f6f5f8] border border-[#e5e3ea] hover:border-[#c4b5fd] font-semibold text-[13px] px-4 py-2 rounded-[9px] transition-colors"
-        >
-          Retry
-        </button>
+        <span className="text-[13px] text-[var(--color-error-text)]">{error}</span>
+        <Button variant="secondary" size="sm" onClick={onLoadMore}>
+          {t("loadMore.retry")}
+        </Button>
       </div>
     );
   }
@@ -31,16 +37,22 @@ export default function LoadMoreFooter({ loading, error, hasMore, endLabel, onLo
   if (hasMore) {
     return (
       <div className="flex items-center justify-center mt-4">
-        <button
+        <Button
+          variant="secondary"
+          size="sm"
+          loading={loading}
+          loadingText={t("loadMore.loading")}
           onClick={onLoadMore}
-          disabled={loading}
-          className="bg-[#f6f5f8] border border-[#e5e3ea] enabled:hover:border-[#c4b5fd] disabled:opacity-50 font-semibold text-[13px] px-5 py-2 rounded-[9px] transition-colors"
         >
-          {loading ? 'Loading…' : 'Load more'}
-        </button>
+          {t("loadMore.loadMore")}
+        </Button>
       </div>
     );
   }
 
-  return <p className="text-[13px] text-[#c3c1cb] text-center mt-4">{endLabel}</p>;
+  return (
+    <p className="text-[13px] text-[var(--color-text-muted)] text-center mt-4">
+      {endLabel}
+    </p>
+  );
 }

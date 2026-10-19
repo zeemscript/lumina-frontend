@@ -16,6 +16,17 @@ export interface RouteInfo {
   label: string;
   /** One sentence about the page, used for its meta description and social card. */
   description: string;
+  /** Prefetch only the destinations users reach most often from the nav. */
+  prefetch?: boolean;
+  /**
+   * Whether the sitemap should list this route. Defaults to true.
+   *
+   * False is for a route that exists but has nothing for a crawler: `/watch`
+   * renders from the visitor's own localStorage, so an anonymous request gets an
+   * empty page. It is still a real page and still in the nav — a watch list
+   * cannot be in anyone's bookmarks if it is not linked from anywhere.
+   */
+  indexable?: boolean;
 }
 
 export const HOME: RouteInfo = {
@@ -23,6 +34,7 @@ export const HOME: RouteInfo = {
   label: "Home",
   description:
     "Lumina indexes Stellar into Postgres and serves it over a typed GraphQL API: ledgers, transactions, operations, accounts and Soroban contract events.",
+  prefetch: true,
 };
 
 export const EXPLORER: RouteInfo = {
@@ -30,6 +42,7 @@ export const EXPLORER: RouteInfo = {
   label: "Explorer",
   description:
     "Search any Stellar account or browse recent transactions, updated live over a GraphQL subscription.",
+  prefetch: true,
 };
 
 export const TRANSACTIONS: RouteInfo = {
@@ -37,18 +50,42 @@ export const TRANSACTIONS: RouteInfo = {
   label: "Transactions",
   description:
     "Every indexed Stellar transaction, with filters, saved presets and cursor pagination.",
+  prefetch: true,
+};
+
+export const SEARCH: RouteInfo = {
+  path: "/search",
+  label: "Search",
+  description:
+    "Memo search across every indexed transaction — order references and short codes, ranked by the backend's trigram similarity.",
 };
 
 export const EVENTS: RouteInfo = {
   path: "/events",
   label: "Contract Events",
-  description: "Soroban contract events indexed by Lumina, filterable by contract id.",
+  description:
+    "Soroban contract events indexed by Lumina, filterable by contract id.",
+};
+
+export const ASSETS: RouteInfo = {
+  path: "/assets",
+  label: "Assets",
+  description:
+    "Every Stellar asset Lumina indexes — supply and holder counts, ordered by holders or by transfer volume.",
 };
 
 export const GRAPHQL: RouteInfo = {
   path: "/graphql",
   label: "GraphQL",
-  description: "Run queries against the Lumina GraphQL API from the browser, with worked examples.",
+  description:
+    "Run queries against the Lumina GraphQL API from the browser, with worked examples.",
+};
+
+export const DEVELOPERS: RouteInfo = {
+  path: "/developers",
+  label: "Developers",
+  description:
+    "API documentation, getting-started guide, and usage dashboard for developers building with Lumina.",
 };
 
 export const REGISTRY: RouteInfo = {
@@ -63,6 +100,17 @@ export const STATS: RouteInfo = {
   label: "Stats",
   description:
     "Indexer health and Stellar network throughput: latest ledger, transaction volume and the mix of operation types.",
+  prefetch: true,
+};
+
+export const WATCHES: RouteInfo = {
+  path: "/watch",
+  label: "Watch",
+  description:
+    "Follow Stellar addresses: one live feed of activity across everything you watch, with per-address alert filters.",
+  // Every byte of this page comes from the visitor's own localStorage, so a
+  // crawler fetching it sees the empty state and nothing else.
+  indexable: false,
 };
 
 /**
@@ -77,14 +125,25 @@ export const STABLE_ROUTES: readonly RouteInfo[] = [
   HOME,
   EXPLORER,
   TRANSACTIONS,
+  SEARCH,
   EVENTS,
+  ASSETS,
   GRAPHQL,
+  DEVELOPERS,
   REGISTRY,
   STATS,
+  WATCHES,
 ];
 
+/** The sitemap lists the indexable subset of the inventory. */
+export const INDEXABLE_ROUTES: readonly RouteInfo[] = STABLE_ROUTES.filter(
+  (route) => route.indexable !== false,
+);
+
 /** The nav shows every route except the home page, which the wordmark links to. */
-export const NAV_ROUTES: readonly RouteInfo[] = STABLE_ROUTES.filter(route => route.path !== HOME.path);
+export const NAV_ROUTES: readonly RouteInfo[] = STABLE_ROUTES.filter(
+  (route) => route.path !== HOME.path,
+);
 
 export interface CrawlExclusion {
   /** A robots.txt path prefix; the trailing `*` is a Google/Bing wildcard. */
@@ -108,8 +167,13 @@ export const CRAWL_EXCLUDED: readonly CrawlExclusion[] = [
       "one page per Stellar address — an unbounded set, and none of them is a route anyone arrives on directly",
   },
   {
+    pattern: "/transactions/",
+    reason:
+      "one page per transaction hash — an unbounded set for the same reason as account pages",
+  },
+  {
     pattern: "/*?",
     reason:
-      "filter and search permutations (?contractId=, ?category=, ?status=…) are the same content as the canonical route, so they multiply the URL space without adding anything to crawl",
+      "filter and search permutations (?contractId=, ?category=, ?status=, ?q=…) are the same content as the canonical route, so they multiply the URL space without adding anything to crawl",
   },
 ];

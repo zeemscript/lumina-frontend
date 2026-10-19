@@ -8,12 +8,16 @@
  * form has never had a test. As a component taking an injectable `register`, it
  * can have one.
  */
-import { useState } from 'react';
-import { nativeToScVal } from '@stellar/stellar-sdk';
+import { useEffect, useState } from 'react';
+import { nativeToScVal } from '@stellar/stellar-sdk/base';
 import { REGISTRY_CATEGORIES, type RegistryCategory } from '@/lib/categories';
 import { NETWORK_PASSPHRASE, REGISTRY_CONTRACT_ID, SOROBAN_RPC_URL } from '@/lib/registry';
 import { createStellarDriver, submitContractCall, type TxPhase } from '@/lib/sorobanTx';
-import { truncateAddress } from '@/lib/formatters';
+import { formatStroops } from '@/lib/formatters';
+import { Button } from '@/components/ui/Button';
+import { Fieldset, TextField, TextareaField } from '@/components/ui/FormField';
+import { t } from '@/lib/i18n';
+
 
 export interface RegistrationInput {
   contractId: string;
@@ -28,8 +32,9 @@ export interface RegisterContractFormProps {
     input: RegistrationInput,
     owner: string,
     onPhase: (p: TxPhase) => void,
-    wait?: (ms: number) => Promise<void>
-  ) => Promise<void>;
+    wait?: (ms: number) => Promise<void>,
+    onFeeEstimated?: (fee: string) => void
+  ) => Promise<{ hash: string } | void>;
   /** Overrides transaction polling delay in integration tests. */
   transactionWait?: (ms: number) => Promise<void>;
   onRegistered?: () => void;
@@ -39,13 +44,14 @@ const defaultRegister = async (
   input: RegistrationInput,
   owner: string,
   onPhase: (p: TxPhase) => void,
-  wait?: (ms: number) => Promise<void>
+  wait?: (ms: number) => Promise<void>,
+  onFeeEstimated?: (fee: string) => void
 ) => {
   // Lazy so the browser-only wallet kit stays out of this module's import
   // graph — see the matching note in OwnerContracts.
   const { signWithWallet } = await import('@/lib/wallet');
 
-  await submitContractCall({
+  const result = await submitContractCall({
     driver: createStellarDriver({
       rpcUrl: SOROBAN_RPC_URL,
       networkPassphrase: NETWORK_PASSPHRASE,
@@ -71,23 +77,36 @@ const defaultRegister = async (
         nativeToScVal(input.categories, { type: input.categories.map(() => 'symbol') }),
       ],
     },
-    sign: signWithWallet,
+    sign: async (xdr, opts) => {
+      const signResult = await signWithWallet(xdr, opts);
+      if ('error' in signResult) {
+        throw new Error(signResult.error);
+      }
+      return { signedTxXdr: signResult.signedTxXdr };
+    },
     walletAddress: owner,
     networkPassphrase: NETWORK_PASSPHRASE,
     onPhase,
+    onFeeEstimated,
     wait,
   });
+  return { hash: result.hash };
 };
 
-const SUBMIT_LABELS: Record<TxPhase, string> = {
-  idle: 'Register Contract',
-  building: 'Preparing transaction…',
-  'awaiting-signature': 'Approve in your wallet…',
-  submitting: 'Submitting…',
-  confirming: 'Confirming…',
-  success: 'Register Contract',
-  error: 'Register Contract',
+const SUBMIT_LABEL_KEYS: Record<TxPhase, Parameters<typeof t>[0]> = {
+  idle: 'register.registerContract',
+  building: 'register.preparingTransaction',
+  'awaiting-signature': 'register.approveInWallet',
+  submitting: 'register.submitting',
+  confirming: 'register.confirming',
+  success: 'register.registerContract',
+  error: 'register.registerContract',
 };
+const SUBMIT_LABELS = new Proxy({} as Record<TxPhase, string>, {
+  get(_target, prop: TxPhase) {
+    return t(SUBMIT_LABEL_KEYS[prop]);
+  },
+});
 
 export default function RegisterContractForm({
   walletAddress,
@@ -102,8 +121,22 @@ export default function RegisterContractForm({
   const [categoryError, setCategoryError] = useState('');
   const [phase, setPhase] = useState<TxPhase>('idle');
   const [message, setMessage] = useState('');
+  const [transactionHash, setTransactionHash] = useState<string | null>(null);
+  const [estimatedFee, setEstimatedFee] = useState<string | null>(null);
 
   const busy = phase === 'building' || phase === 'awaiting-signature' || phase === 'submitting' || phase === 'confirming';
+
+  useEffect(() => {
+    if (!busy) return;
+
+    const handleBeforeUnload = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+      e.returnValue = '';
+    };
+
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    return () => window.removeEventListener('beforeunload', handleBeforeUnload);
+  }, [busy]);
 
   function toggleCategory(category: RegistryCategory) {
     setCategoryError('');
@@ -126,83 +159,78 @@ export default function RegisterContractForm({
     // The contract rejects an empty category list (`NoCategories`), and a
     // silent no-op submit would leave the user wondering why nothing happened.
     if (input.categories.length === 0) {
-      setCategoryError('Select at least one category.');
+      setCategoryError(t('register.selectCategory'));
       return;
     }
 
     setMessage('');
-    // Enter the busy phase here rather than waiting for `register` to report
-    // it. Deriving the double-submit guard from the callee's progress
-    // callback means a submit path that never reports one leaves the button
-    // live, and the second click spends real fees.
+    setEstimatedFee(null);
     setPhase('building');
     try {
-      await register(input, walletAddress, setPhase, transactionWait);
+      const result = await register(input, walletAddress, setPhase, transactionWait, setEstimatedFee);
+      if (result?.hash) {
+        setTransactionHash(result.hash);
+        sessionStorage.setItem(`tx-${Date.now()}`, result.hash);
+      }
       setPhase('success');
-      setMessage(`${input.name} registered — Lumina will begin indexing shortly.`);
+      setMessage(t('register.successMessage', { name: input.name }));
       setContractId('');
       setName('');
       setDescription('');
       setCategories([]);
+      setTransactionHash(null);
+      setEstimatedFee(null);
       onRegistered?.();
     } catch (err) {
       setPhase('error');
-      setMessage(err instanceof Error ? err.message : 'Registration failed.');
+      setMessage(err instanceof Error ? err.message : t('register.registrationFailed'));
+      if (transactionHash) {
+        sessionStorage.setItem(`tx-${Date.now()}`, transactionHash);
+      }
     }
   }
 
   return (
     <form onSubmit={handleSubmit} className="flex flex-col gap-3.5">
-      <div className="text-xs text-[#6b6975] bg-white border border-[#e5e3ea] rounded-lg px-3 py-2 mono break-all">
-        Connected: {truncateAddress(walletAddress, 6)}
-      </div>
 
-      <div>
-        <label htmlFor="reg-contract-id" className="block text-xs font-semibold text-[#6b6975] mb-1.5">
-          Contract ID
-        </label>
-        <input
-          id="reg-contract-id"
-          value={contractId}
-          onChange={e => setContractId(e.target.value)}
-          placeholder="CABC...EXAMPLE"
-          className="w-full min-h-[42px] px-3 py-2 text-[13px] mono bg-white border border-[#e5e3ea] rounded-lg"
-          required
-        />
-      </div>
+      <TextField
+        id="reg-contract-id"
+        label={t('register.contractId')}
+        value={contractId}
+        onChange={e => setContractId(e.target.value)}
+        placeholder="CABC...EXAMPLE"
+        inputClassName="mono"
+        required
+      />
 
-      <div>
-        <label htmlFor="reg-name" className="block text-xs font-semibold text-[#6b6975] mb-1.5">
-          Project Name
-        </label>
-        <input
-          id="reg-name"
-          value={name}
-          onChange={e => setName(e.target.value)}
-          placeholder="My Protocol"
-          className="w-full min-h-[42px] px-3 py-2 text-sm bg-white border border-[#e5e3ea] rounded-lg"
-          required
-        />
-      </div>
+      <TextField
+        id="reg-name"
+        label={t('register.projectName')}
+        value={name}
+        onChange={e => setName(e.target.value)}
+        placeholder="My Protocol"
+        required
+      />
 
-      <div>
-        <label htmlFor="reg-description" className="block text-xs font-semibold text-[#6b6975] mb-1.5">
-          Description
-        </label>
-        <textarea
-          id="reg-description"
-          value={description}
-          onChange={e => setDescription(e.target.value)}
-          rows={3}
-          placeholder="A DeFi protocol on Stellar"
-          className="w-full px-3 py-2 text-sm bg-white border border-[#e5e3ea] rounded-lg resize-y"
-        />
-      </div>
+      <TextareaField
+        id="reg-description"
+        label={t('register.description')}
+        value={description}
+        onChange={e => setDescription(e.target.value)}
+        rows={3}
+        placeholder="A DeFi protocol on Stellar"
+        inputClassName="resize-y"
+      />
 
-      <fieldset>
-        <legend className="block text-xs font-semibold text-[#6b6975] mb-1.5">
-          Categories <span className="text-[#a6a3b0] font-normal">(pick at least one)</span>
-        </legend>
+      <Fieldset
+        legend={
+          <>
+            {t('register.categoriesLabel')}{' '}
+            <span className="text-[var(--color-text-muted)] font-normal">{t('register.categoriesHint')}</span>
+          </>
+        }
+        error={categoryError || undefined}
+      >
         <div className="flex flex-wrap gap-1.5">
           {REGISTRY_CATEGORIES.map(category => {
             const selected = categories.includes(category);
@@ -214,8 +242,8 @@ export default function RegisterContractForm({
                 onClick={() => toggleCategory(category)}
                 className={`text-xs font-semibold px-2.5 py-1.5 rounded-full border transition-colors ${
                   selected
-                    ? 'bg-[#f5f3ff] text-[#7c3aed] border-[#c4b5fd]'
-                    : 'bg-white text-[#6b6975] border-[#e5e3ea] hover:border-[#c4b5fd]'
+                    ? 'bg-[var(--color-accent-surface)] text-[var(--color-accent-text)] border-[var(--color-border-strong)]'
+                    : 'bg-[var(--color-bg-base)] text-[var(--color-text-secondary)] border-[var(--color-border-default)] hover:border-[var(--color-border-strong)]'
                 }`}
               >
                 {category}
@@ -223,28 +251,32 @@ export default function RegisterContractForm({
             );
           })}
         </div>
-        {categoryError && (
-          <p role="alert" className="text-xs text-[#dc2626] mt-1.5">
-            {categoryError}
-          </p>
-        )}
-      </fieldset>
+      </Fieldset>
 
-      <button
+      <Button
         type="submit"
-        disabled={busy}
-        className="bg-[#8b5cf6] hover:bg-[#7c3aed] disabled:opacity-50 text-white font-bold text-sm py-3 rounded-lg mt-1 transition-colors"
+        variant="primary"
+        size="md"
+        loading={busy}
+        loadingText={SUBMIT_LABELS[phase]}
+        className="mt-1 w-full"
       >
         {SUBMIT_LABELS[phase]}
-      </button>
+      </Button>
+
+      {estimatedFee && phase !== 'idle' && phase !== 'success' && (
+        <p className="text-xs text-[var(--color-text-muted)] text-center">
+          {t("register.estimatedFee", { fee: formatStroops(estimatedFee) })}
+        </p>
+      )}
 
       {phase === 'success' && (
-        <div role="status" className="text-xs text-[#16a34a] bg-[#f0fdf4] rounded-lg px-3 py-2.5">
+        <div role="status" className="text-xs text-[var(--color-success-text)] bg-[var(--color-success-bg)] rounded-lg px-3 py-2.5">
           {message}
         </div>
       )}
       {phase === 'error' && (
-        <div role="alert" className="text-xs text-[#dc2626] bg-[#fef2f2] rounded-lg px-3 py-2.5">
+        <div role="alert" className="text-xs text-[var(--color-error-text)] bg-[var(--color-error-bg)] rounded-lg px-3 py-2.5">
           {message}
         </div>
       )}

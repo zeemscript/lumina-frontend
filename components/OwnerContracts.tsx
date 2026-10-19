@@ -13,7 +13,7 @@ import { OwnerContractEventsDocument as EVENTS_QUERY } from "@/lib/generated/gra
  * has never had.
  */
 import { useCallback, useEffect, useState } from "react";
-import { nativeToScVal, type xdr } from "@stellar/stellar-sdk";
+import { nativeToScVal, type xdr } from "@stellar/stellar-sdk/base";
 import {
   getContractsByOwner,
   getSlashes,
@@ -33,6 +33,7 @@ import {
   type TxPhase,
 } from "@/lib/sorobanTx";
 import { gqlFetch, PUBLIC_GRAPHQL_URL } from "@/lib/graphql";
+import { useAbortScope, type AbortHandle } from "@/lib/useAbortScope";
 import {
   historyFor,
   parseRegistryEvents,
@@ -45,24 +46,25 @@ import {
   type ActivityState,
 } from '@/lib/contractActivity';
 import type { ContractEvent } from '@/lib/types';
-import { formatStroops, truncateAddress } from '@/lib/formatters';
+import { formatStroops } from '@/lib/formatters';
 import TimeAgo from './TimeAgo';
 import { LifetimeSlashedBadge, StakeBadge, VerifiedBadge } from './RegistryBadges';
 import BackendUnavailable from './BackendUnavailable';
+import ContractLink from './ContractLink';
+import { t } from '@/lib/i18n';
+import { EmptyState } from '@/components/ui/EmptyState';
+import { InlineLoading } from '@/components/ui/InlineLoading';
 
-const EVENTS_QUERY = `
-  query ContractEvents($contractId: String!, $limit: Int) {
-    events(contractId: $contractId, limit: $limit) {
-      items { id type contractId ledger createdAt pagingToken topics value }
-    }
-  }
-`;
-
-async function fetchEvents(contractId: string, limit: number): Promise<ContractEvent[]> {
-  const data = await gqlFetch<{ events: { items: ContractEvent[] } }>(
+async function fetchEvents(
+  contractId: string,
+  limit: number,
+  signal?: AbortSignal,
+): Promise<ContractEvent[]> {
+  const data = await gqlFetch(
     PUBLIC_GRAPHQL_URL,
     EVENTS_QUERY,
-    { contractId, limit }
+    { contractId, limit },
+    { signal },
   );
   return data.events.items;
 }
@@ -70,27 +72,35 @@ async function fetchEvents(contractId: string, limit: number): Promise<ContractE
 export interface OwnerContractsProps {
   walletAddress: string;
   loadContracts?: (owner: string) => Promise<RegistryEntry[]>;
-  loadHistory?: () => Promise<RegistryHistoryEntry[]>;
-  loadActivity?: (contractIds: string[]) => Promise<Map<string, ActivityState>>;
+  loadHistory?: (signal?: AbortSignal) => Promise<RegistryHistoryEntry[]>;
+  loadActivity?: (
+    contractIds: string[],
+    signal?: AbortSignal,
+  ) => Promise<Map<string, ActivityState>>;
   loadStake?: (contractId: string) => Promise<StakeInfo>;
-  deactivate?: (contractId: string, owner: string) => Promise<void>;
-  stake?: (contractId: string, owner: string, amount: bigint) => Promise<void>;
-  withdraw?: (contractId: string, owner: string) => Promise<void>;
+  deactivate?: (contractId: string, owner: string, onFeeEstimated?: (fee: string) => void) => Promise<{ hash: string } | void>;
+  stake?: (contractId: string, owner: string, amount: bigint, onFeeEstimated?: (fee: string) => void) => Promise<{ hash: string } | void>;
+  withdraw?: (contractId: string, owner: string, onFeeEstimated?: (fee: string) => void) => Promise<{ hash: string } | void>;
   /** Notifies the parent so the global list can refresh after a change. */
   onChanged?: () => void;
 }
 
 const defaultLoadContracts = (owner: string) => getContractsByOwner(owner);
 
-const defaultLoadHistory = async () =>
-  parseRegistryEvents(await fetchEvents(REGISTRY_CONTRACT_ID, 100));
+const defaultLoadHistory = async (signal?: AbortSignal) =>
+  parseRegistryEvents(await fetchEvents(REGISTRY_CONTRACT_ID, 100, signal));
 
-const defaultLoadActivity = (contractIds: string[]) =>
-  probeContractActivity(contractIds, (id) => fetchEvents(id, 1));
+const defaultLoadActivity = (contractIds: string[], signal?: AbortSignal) =>
+  probeContractActivity(contractIds, (id) => fetchEvents(id, 1, signal));
 
 const defaultLoadStake = (contractId: string) => getStakeInfo(contractId);
 
-async function callRegistry(owner: string, method: string, args: xdr.ScVal[]) {
+async function callRegistry(
+  owner: string,
+  method: string,
+  args: xdr.ScVal[],
+  onFeeEstimated?: (fee: string) => void
+): Promise<{ hash: string }> {
   // Imported lazily rather than at module scope: the wallet kit pulls in
   // browser-only CommonJS (Freighter et al) that cannot be loaded outside a
   // browser, which would otherwise make this component untestable — the exact
@@ -98,37 +108,45 @@ async function callRegistry(owner: string, method: string, args: xdr.ScVal[]) {
   // static bundle until someone actually signs something.
   const { signWithWallet } = await import("@/lib/wallet");
 
-  await submitContractCall({
+  const result = await submitContractCall({
     driver: createStellarDriver({
       rpcUrl: SOROBAN_RPC_URL,
       networkPassphrase: NETWORK_PASSPHRASE,
       walletAddress: owner,
     }),
     call: { contractId: REGISTRY_CONTRACT_ID, method, args },
-    sign: signWithWallet,
+    sign: async (xdr, opts) => {
+      const signResult = await signWithWallet(xdr, opts);
+      if ('error' in signResult) {
+        throw new Error(signResult.error);
+      }
+      return { signedTxXdr: signResult.signedTxXdr };
+    },
     walletAddress: owner,
     networkPassphrase: NETWORK_PASSPHRASE,
+    onFeeEstimated,
   });
+  return { hash: result.hash };
 }
 
-const defaultDeactivate = (contractId: string, owner: string) =>
+const defaultDeactivate = (contractId: string, owner: string, onFeeEstimated?: (fee: string) => void) =>
   callRegistry(owner, "deactivate", [
     nativeToScVal(owner, { type: "address" }),
     nativeToScVal(contractId, { type: "address" }),
-  ]);
+  ], onFeeEstimated);
 
-const defaultStake = (contractId: string, owner: string, amount: bigint) =>
+const defaultStake = (contractId: string, owner: string, amount: bigint, onFeeEstimated?: (fee: string) => void) =>
   callRegistry(owner, "stake", [
     nativeToScVal(owner, { type: "address" }),
     nativeToScVal(contractId, { type: "address" }),
     nativeToScVal(amount, { type: "i128" }),
-  ]);
+  ], onFeeEstimated);
 
-const defaultWithdraw = (contractId: string, owner: string) =>
+const defaultWithdraw = (contractId: string, owner: string, onFeeEstimated?: (fee: string) => void) =>
   callRegistry(owner, "withdraw_stake", [
     nativeToScVal(owner, { type: "address" }),
     nativeToScVal(contractId, { type: "address" }),
-  ]);
+  ], onFeeEstimated);
 
 /**
  * The unmet good-standing conditions for `withdraw_stake`, worked out up front
@@ -142,18 +160,19 @@ export function withdrawBlockers(
 ): string[] {
   const blockers: string[] = [];
   if (entry.active) {
-    blockers.push(
-      "Deactivate this registration first; stake can only be withdrawn once it is deactivated.",
-    );
+    blockers.push(t("owner.withdrawBlockerActive"));
   }
   if (info && info.withdrawLockedUntil > info.currentLedger) {
     blockers.push(
-      `A slash landed recently, so withdrawal is locked until ledger ${info.withdrawLockedUntil} ` +
-        `(currently ${info.currentLedger}, ${info.withdrawLockedUntil - info.currentLedger} to go).`,
+      t("owner.withdrawBlockerLocked", {
+        until: info.withdrawLockedUntil,
+        current: info.currentLedger,
+        remaining: info.withdrawLockedUntil - info.currentLedger,
+      }),
     );
   }
   if (info && info.stake <= BigInt(0)) {
-    blockers.push("There is no stake to withdraw.");
+    blockers.push(t("owner.withdrawBlockerNoStake"));
   }
   return blockers;
 }
@@ -194,30 +213,37 @@ export default function OwnerContracts({
   const [stakeInfo, setStakeInfo] = useState<Record<string, StakeInfo>>({});
   const [stakeInput, setStakeInput] = useState<Record<string, string>>({});
   const [rowError, setRowError] = useState<Record<string, string>>({});
+  const [pendingTxHash, setPendingTxHash] = useState<string | null>(null);
+  const [estimatedFee, setEstimatedFee] = useState<string | null>(null);
+
+  // Every read below is started through this scope, so a wallet switch or an
+  // unmount cancels them instead of letting a slow answer land afterwards.
+  const scope = useAbortScope(walletAddress);
 
   const applyLoaded = useCallback(
-    (owned: RegistryEntry[], isCurrent: () => boolean) => {
-      if (!isCurrent()) return;
+    (owned: RegistryEntry[], req: AbortHandle) => {
+      if (!req.isCurrent()) return;
       setEntries(owned);
       setState("ready");
 
       // History, activity and reputation are decoration: a registry read that
       // succeeded should render even if the indexer is unreachable, so these
-      // are deliberately not chained onto the read above.
-      loadHistory()
-        .then((h) => isCurrent() && setHistory(h))
-        .catch(() => isCurrent() && setHistory([]));
+      // are deliberately not chained onto the read above. They share the
+      // registry read's signal — what cancels it cancels them too.
+      loadHistory(req.signal)
+        .then((h) => req.isCurrent() && setHistory(h))
+        .catch(() => req.isCurrent() && setHistory([]));
       if (owned.length > 0) {
-        loadActivity(owned.map((e) => e.contractId))
-          .then((a) => isCurrent() && setActivity(a))
-          .catch(() => isCurrent() && setActivity(new Map()));
+        loadActivity(owned.map((e) => e.contractId), req.signal)
+          .then((a) => req.isCurrent() && setActivity(a))
+          .catch(() => req.isCurrent() && setActivity(new Map()));
         // Stake is decoration too: without it the controls still work, they
         // just cannot pre-explain a blocked withdrawal.
         owned.forEach((e) =>
           loadStake(e.contractId)
             .then(
               (info) =>
-                isCurrent() &&
+                req.isCurrent() &&
                 setStakeInfo((prev) => ({ ...prev, [e.contractId]: info })),
             )
             .catch(() => {}),
@@ -227,47 +253,57 @@ export default function OwnerContracts({
     [loadHistory, loadActivity, loadStake],
   );
 
-  const applyError = useCallback((_err: unknown, isCurrent: () => boolean) => {
-    if (!isCurrent()) return;
+  const applyError = useCallback((_err: unknown, req: AbortHandle) => {
+    if (!req.isCurrent()) return;
     setState('error');
   }, []);
 
-  // History is per row, and the panels are long enough that leaving several
-  // open at once turns the dashboard into a wall — so opening one closes the
-  // last.
-  const toggleHistory = useCallback(
-    (entry: { contractId: string }) =>
-      setExpanded(current => (current === entry.contractId ? null : entry.contractId)),
-    []
-  );
-
   useEffect(() => {
-    // The effect body only starts the fetch; every setState happens in a
-    // settled-promise handler. `cancelled` stops a slow read writing into a
-    // component that has since unmounted or switched wallet.
-    let cancelled = false;
-    const isCurrent = () => !cancelled;
+    // The effect body only starts the reads; every setState happens in a
+    // settled-promise handler, and only while its request is still the current
+    // one — a wallet switch or an unmount has already cancelled the rest.
+    const req = scope.next();
 
     loadContracts(walletAddress).then(
-      (owned) => applyLoaded(owned, isCurrent),
-      (err) => applyError(err, isCurrent),
+      (owned) => applyLoaded(owned, req),
+      (err) => applyError(err, req),
     );
+  }, [scope, walletAddress, loadContracts, applyLoaded, applyError]);
 
-    return () => {
-      cancelled = true;
+  const pendingTxInFlight = pendingPhase === 'building' || pendingPhase === 'awaiting-signature' || pendingPhase === 'submitting' || pendingPhase === 'confirming';
+
+  useEffect(() => {
+    if (!pendingTxInFlight) return;
+
+    const handleBeforeUnload = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+      e.returnValue = '';
     };
-  }, [walletAddress, loadContracts, applyLoaded, applyError]);
+
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    return () => window.removeEventListener('beforeunload', handleBeforeUnload);
+  }, [pendingTxInFlight]);
 
   /** Retry, driven by a click rather than an effect. */
   const retry = useCallback(() => {
-    const isCurrent = () => true;
+    const req = scope.next();
     setState("loading");
-    setError(null);
     loadContracts(walletAddress).then(
-      (owned) => applyLoaded(owned, isCurrent),
-      (err) => applyError(err, isCurrent),
+      (owned) => applyLoaded(owned, req),
+      (err) => applyError(err, req),
     );
-  }, [walletAddress, loadContracts, applyLoaded, applyError]);
+  }, [scope, walletAddress, loadContracts, applyLoaded, applyError]);
+
+  /**
+   * Re-read the history after a change, on the same lifetime as the rest: if
+   * the component goes away mid-read the answer is cancelled, not applied.
+   */
+  const refreshHistory = useCallback(() => {
+    const req = scope.next();
+    loadHistory(req.signal)
+      .then((h) => req.isCurrent() && setHistory(h))
+      .catch(() => {});
+  }, [scope, loadHistory]);
 
   async function toggleHistory(entry: RegistryEntry) {
     const id = entry.contractId;
@@ -285,7 +321,7 @@ export default function OwnerContracts({
         [id]:
           error instanceof Error
             ? error.message
-            : "Could not load slash history.",
+            : t("owner.couldNotLoadSlashHistory"),
       }));
     } finally {
       setSlashesLoading((prev) => ({ ...prev, [id]: false }));
@@ -302,12 +338,13 @@ export default function OwnerContracts({
   async function runRowAction(
     entry: RegistryEntry,
     action: "stake" | "withdraw",
-    work: () => Promise<void>,
+    work: () => Promise<{ hash: string } | void>,
     fallback: string,
   ) {
     setPendingId(entry.contractId);
     setPendingAction(action);
     setPendingPhase("building");
+    setEstimatedFee(null);
     setRowError((prev) => {
       const next = { ...prev };
       delete next[entry.contractId];
@@ -315,18 +352,24 @@ export default function OwnerContracts({
     });
 
     try {
-      await work();
+      const result = await work();
+      if (result?.hash) {
+        setPendingTxHash(result.hash);
+        sessionStorage.setItem(`tx-${Date.now()}`, result.hash);
+      }
       refreshStake(entry.contractId);
-      loadHistory()
-        .then(setHistory)
-        .catch(() => {});
+      refreshHistory();
     } catch (err) {
       const message =
         err instanceof Error && err.message ? err.message : fallback;
       setRowError((prev) => ({ ...prev, [entry.contractId]: message }));
+      if (pendingTxHash) {
+        sessionStorage.setItem(`tx-${Date.now()}`, pendingTxHash);
+      }
     } finally {
       setPendingId(null);
       setPendingPhase("idle");
+      setPendingTxHash(null);
     }
   }
 
@@ -335,16 +378,15 @@ export default function OwnerContracts({
     if (!/^\d+$/.test(raw) || BigInt(raw) <= BigInt(0)) {
       setRowError((prev) => ({
         ...prev,
-        [entry.contractId]:
-          "Enter a whole amount greater than zero, in the stake token’s base units.",
+        [entry.contractId]: t("owner.invalidStakeAmount"),
       }));
       return;
     }
     await runRowAction(
       entry,
       "stake",
-      () => stake(entry.contractId, walletAddress, BigInt(raw)),
-      "Staking failed.",
+      () => stake(entry.contractId, walletAddress, BigInt(raw), setEstimatedFee),
+      t("owner.stakingFailed"),
     );
     setStakeInput((prev) => ({ ...prev, [entry.contractId]: "" }));
   }
@@ -353,14 +395,15 @@ export default function OwnerContracts({
     runRowAction(
       entry,
       "withdraw",
-      () => withdraw(entry.contractId, walletAddress),
-      "Withdrawal failed.",
+      () => withdraw(entry.contractId, walletAddress, setEstimatedFee),
+      t("owner.withdrawalFailed"),
     );
 
   async function handleDeactivate(entry: RegistryEntry) {
     setPendingId(entry.contractId);
     setPendingAction("deactivate");
     setPendingPhase("building");
+    setEstimatedFee(null);
     setRowError((prev) => {
       const next = { ...prev };
       delete next[entry.contractId];
@@ -368,7 +411,11 @@ export default function OwnerContracts({
     });
 
     try {
-      await deactivate(entry.contractId, walletAddress);
+      const result = await deactivate(entry.contractId, walletAddress, setEstimatedFee);
+      if (result?.hash) {
+        setPendingTxHash(result.hash);
+        sessionStorage.setItem(`tx-${Date.now()}`, result.hash);
+      }
       // Reflect the new state without a page reload, as the issue requires —
       // the registry read is eventually consistent behind the ledger, so
       // trusting the confirmed transaction is more accurate than re-reading
@@ -379,9 +426,7 @@ export default function OwnerContracts({
         ),
       );
       onChanged?.();
-      loadHistory()
-        .then(setHistory)
-        .catch(() => {});
+      refreshHistory();
       refreshStake(entry.contractId);
     } catch (err) {
       const message =
@@ -389,16 +434,20 @@ export default function OwnerContracts({
           ? err.message
           : err instanceof Error
             ? err.message
-            : "Deactivation failed.";
+            : t("owner.deactivationFailed");
       setRowError((prev) => ({ ...prev, [entry.contractId]: message }));
+      if (pendingTxHash) {
+        sessionStorage.setItem(`tx-${Date.now()}`, pendingTxHash);
+      }
     } finally {
       setPendingId(null);
       setPendingPhase("idle");
+      setPendingTxHash(null);
     }
   }
 
   if (state === "loading") {
-    return <p className="text-sm text-[#a6a3b0]">Loading your contracts…</p>;
+    return <InlineLoading label="Loading your contracts" />;
   }
 
   if (state === 'error') {
@@ -407,14 +456,10 @@ export default function OwnerContracts({
 
   if (entries.length === 0) {
     return (
-      <div className="border border-[#e5e3ea] rounded-xl p-6 text-center">
-        <p className="text-sm text-[#6b6975] mb-1">
-          You haven&apos;t registered any contracts yet.
-        </p>
-        <p className="text-xs text-[#a6a3b0]">
-          Register one with the form to opt it into Lumina indexing.
-        </p>
-      </div>
+      <EmptyState
+        title="No contracts registered yet"
+        description="Register one with the form to opt it into Lumina indexing."
+      />
     );
   }
 
@@ -432,12 +477,12 @@ export default function OwnerContracts({
         return (
           <div
             key={entry.contractId}
-            className="border border-[#e5e3ea] rounded-xl p-4"
+            className="border border-[var(--color-border-default)] rounded-xl p-4"
           >
             <div className="flex items-start justify-between gap-3">
               <div className="min-w-0">
                 <div className="flex items-center gap-2 flex-wrap">
-                  <span className="font-bold text-sm text-[#0e0e12]">
+                  <span className="font-bold text-sm text-[var(--color-text-primary)]">
                     {entry.name}
                   </span>
                   <StatusPill active={entry.active} />
@@ -450,10 +495,10 @@ export default function OwnerContracts({
                     />
                   )}
                 </div>
-                <p className="mono text-[11px] text-[#a6a3b0] mt-1 break-all">
-                  {truncateAddress(entry.contractId, 6)}
+                <p className="text-[11px] mt-1 break-all">
+                  <ContractLink contractId={entry.contractId} truncate={6} />
                 </p>
-                <p className="text-xs text-[#6b6975] mt-1.5">
+                <p className="text-xs text-[var(--color-text-secondary)] mt-1.5">
                   {entry.description}
                 </p>
               </div>
@@ -462,17 +507,17 @@ export default function OwnerContracts({
                 <button
                   onClick={() => handleDeactivate(entry)}
                   disabled={isPending}
-                  className="shrink-0 border border-[#e5e3ea] hover:border-[#dc2626] hover:text-[#dc2626] disabled:opacity-50 text-[#6b6975] font-bold text-xs px-3 py-2 rounded-lg transition-colors"
+                  className="shrink-0 border border-[var(--color-border-default)] hover:border-[var(--color-error-text)] hover:text-[var(--color-error-text)] disabled:opacity-50 text-[var(--color-text-secondary)] font-bold text-xs px-3 py-2 rounded-lg transition-colors"
                 >
                   {isPending && pendingAction === "deactivate"
                     ? DEACTIVATE_LABELS[pendingPhase]
-                    : "Deactivate"}
+                    : t("owner.deactivate")}
                 </button>
               )}
             </div>
 
-            <div className="mt-3 border-t border-[#f0eff3] pt-3">
-              <p className="text-xs text-[#6b6975] mb-2">
+            <div className="mt-3 border-t border-[var(--color-bg-overlay)] pt-3">
+              <p className="text-xs text-[var(--color-text-secondary)] mb-2">
                 Staked:{" "}
                 <span className="mono">
                   {info ? info.stake.toString() : "—"}
@@ -481,8 +526,8 @@ export default function OwnerContracts({
               <div className="flex items-center gap-2 flex-wrap">
                 <input
                   inputMode="numeric"
-                  aria-label={`Stake amount for ${entry.name}`}
-                  placeholder="Amount (base units)"
+                  aria-label={t("owner.stakeAmountLabel", { name: entry.name })}
+                  placeholder={t("owner.stakeAmountPlaceholder")}
                   value={stakeInput[entry.contractId] ?? ""}
                   onChange={(e) =>
                     setStakeInput((prev) => ({
@@ -490,29 +535,29 @@ export default function OwnerContracts({
                       [entry.contractId]: e.target.value,
                     }))
                   }
-                  className="min-h-[34px] px-2.5 text-xs mono bg-[#fafafa] border border-[#e5e3ea] rounded-lg w-44"
+                  className="min-h-[34px] px-2.5 text-xs mono bg-[var(--color-bg-subtle)] border border-[var(--color-border-default)] rounded-lg w-44"
                 />
                 <button
                   onClick={() => handleStake(entry)}
                   disabled={pendingId !== null}
-                  className="border border-[#e5e3ea] hover:border-[#8b5cf6] hover:text-[#7c3aed] disabled:opacity-50 text-[#6b6975] font-bold text-xs px-3 py-2 rounded-lg transition-colors"
+                  className="border border-[var(--color-border-default)] hover:border-[var(--color-border-strong)] hover:text-[var(--color-accent-text)] disabled:opacity-50 text-[var(--color-text-secondary)] font-bold text-xs px-3 py-2 rounded-lg transition-colors"
                 >
                   {isPending && pendingAction === "stake"
-                    ? "Staking…"
-                    : "Stake"}
+                    ? t("owner.staking")
+                    : t("owner.stake")}
                 </button>
                 <button
                   onClick={() => handleWithdraw(entry)}
                   disabled={pendingId !== null || blockers.length > 0}
-                  className="border border-[#e5e3ea] hover:border-[#8b5cf6] hover:text-[#7c3aed] disabled:opacity-50 text-[#6b6975] font-bold text-xs px-3 py-2 rounded-lg transition-colors"
+                  className="border border-[var(--color-border-default)] hover:border-[var(--color-border-strong)] hover:text-[var(--color-accent-text)] disabled:opacity-50 text-[var(--color-text-secondary)] font-bold text-xs px-3 py-2 rounded-lg transition-colors"
                 >
                   {isPending && pendingAction === "withdraw"
-                    ? "Withdrawing…"
-                    : "Withdraw stake"}
+                    ? t("owner.withdrawing")
+                    : t("owner.withdrawStake")}
                 </button>
               </div>
               {blockers.length > 0 && (
-                <ul className="mt-2 list-disc pl-4 text-[11px] text-[#b45309]">
+                <ul className="mt-2 list-disc ps-4 text-[11px] text-[var(--color-warning-text)]">
                   {blockers.map((b) => (
                     <li key={b}>{b}</li>
                   ))}
@@ -523,26 +568,32 @@ export default function OwnerContracts({
             {rowError[entry.contractId] && (
               <div
                 role="alert"
-                className="mt-3 text-xs text-[#dc2626] bg-[#fef2f2] rounded-lg px-3 py-2"
+                className="mt-3 text-xs text-[var(--color-error-text)] bg-[var(--color-error-bg)] rounded-lg px-3 py-2"
               >
                 {rowError[entry.contractId]}
               </div>
             )}
 
+            {estimatedFee && isPending && (
+              <p className="mt-2 text-[11px] text-[var(--color-text-muted)]">
+                {t("register.estimatedFee", { fee: formatStroops(estimatedFee) })}
+              </p>
+            )}
+
             <button
               onClick={() => toggleHistory(entry)}
               aria-expanded={isOpen}
-              className="mt-3 text-[11px] font-bold text-[#8b5cf6] hover:underline underline-offset-2"
+              className="mt-3 text-[11px] font-bold text-[var(--color-accent-text)] hover:underline underline-offset-2"
             >
-              {isOpen ? "Hide history" : `History (${entryHistory.length})`}
+              {isOpen ? t("owner.hideHistory") : t("owner.historyCount", { count: entryHistory.length })}
             </button>
 
             {isOpen && (
-              <div className="mt-2.5 border-t border-[#f0eff3] pt-2.5 flex flex-col gap-3">
+              <div className="mt-2.5 border-t border-[var(--color-bg-overlay)] pt-2.5 flex flex-col gap-3">
                 <ul className="flex flex-col gap-1.5" data-testid="history-list">
                   {entryHistory.length === 0 ? (
-                    <li className="text-xs text-[#a6a3b0]">
-                      No registry events indexed for this contract yet.
+                    <li className="text-xs text-[var(--color-text-muted)]">
+                      {t("owner.noRegistryEvents")}
                     </li>
                   ) : (
                     entryHistory.map((item) => (
@@ -550,10 +601,10 @@ export default function OwnerContracts({
                         key={item.id}
                         className="flex items-baseline justify-between gap-3"
                       >
-                        <span className="text-xs text-[#0e0e12]">
+                        <span className="text-xs text-[var(--color-text-primary)]">
                           {REGISTRY_EVENT_LABELS[item.type]}
                         </span>
-                        <span className="mono text-[11px] text-[#a6a3b0] shrink-0">
+                        <span className="mono text-[11px] text-[var(--color-text-muted)] shrink-0">
                           ledger {item.ledger} · <TimeAgo isoString={item.createdAt} />
                         </span>
                       </li>
@@ -562,11 +613,11 @@ export default function OwnerContracts({
                 </ul>
 
                 <section aria-label="Slash history">
-                  <h4 className="text-[11px] font-bold text-[#a6a3b0] uppercase tracking-[0.05em] mb-1.5">
-                    Slash history
+                  <h4 className="text-[11px] font-bold text-[var(--color-text-muted)] uppercase tracking-[0.05em] mb-1.5">
+                    {t("owner.slashHistory")}
                   </h4>
                   {reputation && reputation.slashedTotal > BigInt(0) && (
-                    <p className="text-xs text-[#6b6975] mb-1.5">
+                    <p className="text-xs text-[var(--color-text-secondary)] mb-1.5">
                       Lifetime slashed:{" "}
                       <span className="mono">
                         {formatStroops(reputation.slashedTotal)} XLM
@@ -574,17 +625,17 @@ export default function OwnerContracts({
                     </p>
                   )}
                   {slashesLoading[entry.contractId] ? (
-                    <p className="text-xs text-[#a6a3b0]">
-                      Loading slash history…
+                    <p className="text-xs text-[var(--color-text-muted)]">
+                      {t("owner.loadingSlashHistory")}
                     </p>
                   ) : slashErrors[entry.contractId] ? (
-                    <p role="alert" className="text-xs text-[#dc2626]">
+                    <p role="alert" className="text-xs text-[var(--color-error-text)]">
                       {slashErrors[entry.contractId]}
                     </p>
                   ) : slashes[entry.contractId] &&
                     slashes[entry.contractId].length === 0 ? (
-                    <p className="text-xs text-[#a6a3b0]">
-                      No slashes recorded.
+                    <p className="text-xs text-[var(--color-text-muted)]">
+                      {t("owner.noSlashes")}
                     </p>
                   ) : (
                     slashes[entry.contractId] && (
@@ -595,16 +646,16 @@ export default function OwnerContracts({
                             key={`${slash.slashedAt}-${i}`}
                             className="flex items-baseline justify-between gap-3"
                           >
-                            <span className="text-xs text-[#0e0e12] min-w-0">
+                            <span className="text-xs text-[var(--color-text-primary)] min-w-0">
                               <span className="mono">
                                 −{formatStroops(slash.amount)} XLM
                               </span>
-                              <span className="text-[#6b6975]">
+                              <span className="text-[var(--color-text-secondary)]">
                                 {" "}
                                 · {slash.reason}
                               </span>
                             </span>
-                            <span className="mono text-[11px] text-[#a6a3b0] shrink-0">
+                            <span className="mono text-[11px] text-[var(--color-text-muted)] shrink-0">
                               ledger {slash.slashedAt.toLocaleString()}
                             </span>
                           </li>
@@ -622,24 +673,29 @@ export default function OwnerContracts({
   );
 }
 
-const DEACTIVATE_LABELS: Record<TxPhase, string> = {
-  idle: "Deactivate",
-  building: "Preparing…",
-  "awaiting-signature": "Approve in wallet…",
-  submitting: "Submitting…",
-  confirming: "Confirming…",
-  success: "Deactivate",
-  error: "Deactivate",
+const DEACTIVATE_LABEL_KEYS: Record<TxPhase, Parameters<typeof t>[0]> = {
+  idle: "owner.deactivate",
+  building: "owner.preparing",
+  "awaiting-signature": "owner.approveInWallet",
+  submitting: "register.submitting",
+  confirming: "register.confirming",
+  success: "owner.deactivate",
+  error: "owner.deactivate",
 };
+const DEACTIVATE_LABELS = new Proxy({} as Record<TxPhase, string>, {
+  get(_target, prop: TxPhase) {
+    return t(DEACTIVATE_LABEL_KEYS[prop]);
+  },
+});
 
 function StatusPill({ active }: { active: boolean }) {
   return (
     <span
       className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${
-        active ? "bg-[#f0fdf4] text-[#16a34a]" : "bg-[#f4f4f5] text-[#6b6975]"
+        active ? "bg-[var(--color-active-bg)] text-[var(--color-active-text)]" : "bg-[var(--color-neutral-bg)] text-[var(--color-neutral-text)]"
       }`}
     >
-      {active ? "Active" : "Deactivated"}
+      {active ? t("owner.active") : t("owner.deactivated")}
     </span>
   );
 }
@@ -647,10 +703,10 @@ function StatusPill({ active }: { active: boolean }) {
 function ActivityPill({ state }: { state: ActivityState }) {
   const tone =
     state === "active"
-      ? "bg-[#f5f3ff] text-[#7c3aed]"
+      ? "bg-[var(--color-accent-surface)] text-[var(--color-accent-text)]"
       : state === "quiet"
-        ? "bg-[#f4f4f5] text-[#a6a3b0]"
-        : "bg-[#fffbeb] text-[#b45309]";
+        ? "bg-[var(--color-neutral-bg)] text-[var(--color-text-muted)]"
+        : "bg-[var(--color-warning-bg)] text-[var(--color-warning-text)]";
 
   return (
     <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${tone}`}>

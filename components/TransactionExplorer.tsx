@@ -6,7 +6,13 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import VirtualizedTransactionTable from "./VirtualizedTransactionTable";
 import { gqlFetch, PUBLIC_GRAPHQL_URL } from "@/lib/graphql";
+import { useAbortScope } from "@/lib/useAbortScope";
 import type { Transaction } from "@/lib/types";
+import {
+  loadExplorerSnapshot,
+  saveExplorerSnapshot,
+  type ExplorerSnapshot,
+} from "@/lib/explorerSnapshot";
 import {
   EMPTY_FILTERS,
   applyFilters,
@@ -22,35 +28,8 @@ import {
   type FilterPreset,
 } from "@/lib/filterPresets";
 import TransactionFilters from "./TransactionFilters";
-import TransactionRow from "./TransactionRow";
 import BackendUnavailable from "./BackendUnavailable";
-
-const PAGE_QUERY = `
-  query TransactionPage($limit: Int, $cursor: String) {
-    transactions(limit: $limit, cursor: $cursor) {
-      items {
-        hash
-        ledger
-        createdAt
-        sourceAccount
-        feeCharged
-        operationCount
-        successful
-      }
-      pageInfo {
-        hasNextPage
-        cursor
-      }
-    }
-  }
-`;
-
-interface TransactionPage {
-  transactions: {
-    items: Transaction[];
-    pageInfo: { hasNextPage: boolean; cursor: string | null };
-  };
-}
+import { t } from "@/lib/i18n";
 
 export const PAGE_SIZE = 50;
 
@@ -66,6 +45,13 @@ export const PAGE_SIZE = 50;
 const MIN_FILTERED_ROWS = 20;
 /** Ceiling on that chase, so a filter matching nothing cannot walk the chain forever. */
 const MAX_AUTO_PAGES = 5;
+
+/**
+ * Debounce for writing the scroll offset. A scroll fires continuously and a
+ * snapshot holds every loaded row, so serializing it on each one would cost
+ * more than it saves.
+ */
+const SNAPSHOT_SAVE_DELAY_MS = 150;
 
 export default function TransactionExplorer({
   initial,
@@ -83,6 +69,12 @@ export default function TransactionExplorer({
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [presets, setPresets] = useState<FilterPreset[]>([]);
+  // Offset read back from this view's snapshot, handed to the table, which
+  // re-applies it once the virtualized rows exist to scroll against.
+  const [restoredScrollTop, setRestoredScrollTop] = useState(0);
+  const loadedHashes = useRef(new Set<string>());
+  const loadingRef = useRef(false);
+  const requestControllerRef = useRef<AbortController | null>(null);
 
   // The URL is the source of truth for filters, so a refresh, a back button
   // and a pasted link all land on the same view.
@@ -90,9 +82,13 @@ export default function TransactionExplorer({
     () => filtersFromQueryString(searchParams.toString()),
     [searchParams],
   );
+  const filterKey = useMemo(() => filtersToQueryString(filters), [filters]);
 
   const setFilters = useCallback(
     (next: Filters) => {
+      // A changed filter makes an auto-page chase obsolete. Aborting it lets
+      // the next filter start its own request as soon as this one settles.
+      requestControllerRef.current?.abort();
       const query = filtersToQueryString(next);
       router.replace(query ? `${pathname}?${query}` : pathname, {
         scroll: false,
@@ -108,20 +104,66 @@ export default function TransactionExplorer({
     setPresets(loadPresets());
   }, []);
 
-  const loadedHashes = useRef(new Set<string>());
-  const loadingRef = useRef(false);
+  useEffect(() => () => requestControllerRef.current?.abort(), []);
+
+  // Key this view's snapshot is stored under. Kept in step with the filters on
+  // screen, so narrowing the list re-keys the saved view rather than
+  // overwriting the unfiltered one with a filtered offset.
+  const snapshotKeyRef = useRef<string>(filterKey);
+  useEffect(() => {
+    snapshotKeyRef.current = filterKey;
+  }, [filterKey]);
+
+  // Everything worth restoring, held in one ref so the scroll handler and the
+  // unmount flush below can save the current view without re-subscribing.
+  const latestRef = useRef<ExplorerSnapshot>({
+    txs: initial ?? [],
+    cursor: null,
+    hasNextPage: true,
+    scrollTop: 0,
+  });
+  const saveTimerRef = useRef<number | null>(null);
+
+  const scheduleSnapshotSave = useCallback(() => {
+    if (saveTimerRef.current !== null) return;
+    saveTimerRef.current = window.setTimeout(() => {
+      saveTimerRef.current = null;
+      saveExplorerSnapshot(snapshotKeyRef.current, latestRef.current);
+    }, SNAPSHOT_SAVE_DELAY_MS);
+  }, []);
+
+  const handleScrollTopChange = useCallback(
+    (scrollTop: number) => {
+      latestRef.current = { ...latestRef.current, scrollTop };
+      scheduleSnapshotSave();
+    },
+    [scheduleSnapshotSave],
+  );
+
+  // The list's fetches live as long as this component does: navigating away
+  // cancels a page that is still on its way.
+  const scope = useAbortScope();
 
   const loadMore = useCallback(() => {
     if (loadingRef.current) return;
     loadingRef.current = true;
+    const controller = new AbortController();
+    requestControllerRef.current = controller;
     setLoading(true);
     setError(null);
 
-    return gqlFetch(PUBLIC_GRAPHQL_URL, PAGE_QUERY, {
-      limit: PAGE_SIZE,
-      cursor,
-    })
+    // Supersedes any page still in flight: leaving the page mid-request must
+    // not let that request land afterwards and write into state.
+    const req = scope.next();
+
+    return gqlFetch(
+      PUBLIC_GRAPHQL_URL,
+      PAGE_QUERY,
+      { limit: PAGE_SIZE, cursor },
+      { signal: req.signal },
+    )
       .then((data) => {
+        if (!req.isCurrent()) return;
         const page = data.transactions;
 
         setTxs((current) => {
@@ -139,28 +181,82 @@ export default function TransactionExplorer({
         );
       })
       .catch(() => {
-        setError("Could not load more transactions.");
+        if (!req.isCurrent()) return;
+        setError(t("explorer.couldNotLoad"));
         // Stop the sentinel from immediately retrying in a tight loop; the
         // explicit retry button puts the user back in control.
         setHasNextPage(false);
       })
       .finally(() => {
+        // The spinner resolves however the request ended — a cancelled one
+        // settles immediately — but only this request's data is ever applied.
         loadingRef.current = false;
         setLoading(false);
       });
-  }, [cursor]);
+  }, [scope, cursor]);
 
-  // First page. `initial` is server-rendered, so only fetch when there is none.
-  const started = useRef(false);
+  // ── Return to where the reader was ──────────────────────────────────────
+  //
+  // A cursor is only meaningful against the rows it produced, so the loaded
+  // pages and the offset have to come back together. Restoring only the offset
+  // would land the reader at the top of page one, which is the bug this is
+  // here to fix.
+  const bootstrapped = useRef(false);
   useEffect(() => {
-    if (started.current) return;
-    started.current = true;
-    if (!initial || initial.length === 0) void loadMore();
-    else for (const tx of initial) loadedHashes.current.add(tx.hash);
-  }, [initial, loadMore]);
+    if (bootstrapped.current) return;
+    bootstrapped.current = true;
+
+    const snapshot = loadExplorerSnapshot(
+      filtersToQueryString(filtersFromQueryString(searchParams.toString())),
+    );
+    if (snapshot && snapshot.txs.length > 0) {
+      for (const tx of snapshot.txs) loadedHashes.current.add(tx.hash);
+      latestRef.current = snapshot;
+      // sessionStorage does not exist during the server pass, so this cannot be
+      // the `useState` initial value without the first client render
+      // disagreeing with the server's HTML. One update on mount is the point.
+      /* eslint-disable react-hooks/set-state-in-effect -- post-hydration restore, see above */
+      setTxs(snapshot.txs);
+      setCursor(snapshot.cursor);
+      setHasNextPage(snapshot.hasNextPage);
+      setRestoredScrollTop(snapshot.scrollTop);
+      /* eslint-enable react-hooks/set-state-in-effect */
+      return;
+    }
+
+    // Nothing to restore: `initial` is server-rendered, so only fetch when
+    // there is none.
+    if (initial && initial.length > 0) {
+      for (const tx of initial) loadedHashes.current.add(tx.hash);
+    } else {
+      void loadMore();
+    }
+  }, [initial, loadMore, searchParams]);
+
+  // Keep the stored view in step with the rows on screen, so a page loaded now
+  // is part of what come-back restores.
+  useEffect(() => {
+    latestRef.current = { ...latestRef.current, txs, cursor, hasNextPage };
+    if (txs.length === 0) return;
+    saveExplorerSnapshot(snapshotKeyRef.current, latestRef.current);
+  }, [txs, cursor, hasNextPage]);
+
+  // Leaving the page is the moment the offset matters most and the last scroll
+  // event may still be sitting in the debounce, so flush it on the way out.
+  useEffect(
+    () => () => {
+      if (saveTimerRef.current === null) return;
+      window.clearTimeout(saveTimerRef.current);
+      saveTimerRef.current = null;
+      saveExplorerSnapshot(snapshotKeyRef.current, latestRef.current);
+    },
+    [],
+  );
 
   useEffect(() => {
-    const retry = () => { if (error || txs.length === 0) void loadMore(); };
+    const retry = () => {
+      if (error || txs.length === 0) void loadMore();
+    };
     window.addEventListener("lumina:online", retry);
     return () => window.removeEventListener("lumina:online", retry);
   }, [error, txs.length, loadMore]);
@@ -182,7 +278,6 @@ export default function TransactionExplorer({
   }, [filters, filtered.length, hasNextPage, loading, loadMore]);
 
   // Reset the chase budget whenever the filter itself changes.
-  const filterKey = filtersToQueryString(filters);
   useEffect(() => {
     autoPages.current = 0;
   }, [filterKey]);
@@ -235,76 +330,61 @@ export default function TransactionExplorer({
         onDeletePreset={handleDeletePreset}
       />
 
-      <div className="flex items-center justify-between mb-3 text-[13px] text-[#6b6975]">
+      <div className="flex items-center justify-between mb-3 text-[13px] text-[var(--color-text-secondary)]">
         <span data-testid="result-count">
           {filtering
-            ? `${filtered.length} of ${txs.length} loaded`
-            : `${txs.length} loaded`}
+            ? t("explorer.filteredCount", {
+                filtered: filtered.length,
+                total: txs.length,
+              })
+            : t("explorer.loadedCount", { count: txs.length })}
         </span>
-        {loading && (
-          <span className="text-[#a6a3b0] animate-pulse">Loading&hellip;</span>
-        )}
+        <span
+          role="status"
+          aria-live="polite"
+          className="text-[var(--color-text-muted)] animate-pulse"
+        >
+          {loading ? t("explorer.loading") : ""}
+        </span>
       </div>
 
-      <div
-        ref={scrollRef}
-        data-testid="transaction-scroll"
-        className="rounded-xl border border-[#e5e3ea] overflow-auto max-h-[70vh]"
-      >
-        <table className="w-full text-sm border-collapse">
-          <thead className="sticky top-0 z-10">
-            <tr>
-              <th className={`${th} w-6`} />
-              <th className={th}>Hash</th>
-              <th className={th}>Ledger</th>
-              <th className={th}>Source</th>
-              <th className={th}>Ops</th>
-              <th className={th}>Fee</th>
-              <th className={th}>Time</th>
-            </tr>
-          </thead>
-          <tbody>
-            {paddingTop > 0 && (
-              <tr aria-hidden="true">
-                <td colSpan={7} style={{ height: paddingTop }} />
-              </tr>
-            )}
-            {virtualRows.map(virtualRow => (
-              <TransactionRow key={filtered[virtualRow.index].hash} tx={filtered[virtualRow.index]} />
-            ))}
-            {paddingBottom > 0 && (
-              <tr aria-hidden="true">
-                <td colSpan={7} style={{ height: paddingBottom }} />
-              </tr>
-            )}
-          </tbody>
-        </table>
-
-        {filtered.length === 0 && !loading && !error && (
-          <div className="p-8 text-center text-[#a6a3b0] text-sm">
-            {txs.length === 0
-              ? "No transactions indexed yet."
-              : "No transactions match these filters."
+      <VirtualizedTransactionTable
+        transactions={filtered}
+        emptyMessage={
+          !loading && !error
+            ? txs.length === 0
+              ? t("explorer.noTransactionsYet")
+              : t("explorer.noMatchingFilters")
+            : null
         }
+        initialScrollTop={restoredScrollTop}
+        onScrollTopChange={handleScrollTopChange}
       >
         <div ref={sentinelRef} data-testid="scroll-sentinel" className="h-px" />
       </VirtualizedTransactionTable>
 
       <div className="mt-4 flex items-center justify-center gap-3">
         {error && txs.length === 0 ? (
-          <BackendUnavailable onRetry={() => { setHasNextPage(true); void loadMore(); }} />
+          <BackendUnavailable
+            onRetry={() => {
+              setHasNextPage(true);
+              void loadMore();
+            }}
+          />
         ) : error ? (
           <>
-            <span className="text-[13px] text-[#dc2626]">{error}</span>
+            <span className="text-[13px] text-[var(--color-error-text)]">
+              {error}
+            </span>
             <button
               type="button"
               onClick={() => {
                 setHasNextPage(true);
                 void loadMore();
               }}
-              className="bg-[#f6f5f8] border border-[#e5e3ea] hover:border-[#c4b5fd] font-semibold text-[13px] px-4 py-2 rounded-[9px] transition-colors"
+              className="bg-[var(--color-bg-raised)] border border-[var(--color-border-default)] hover:border-[var(--color-border-strong)] font-semibold text-[13px] px-4 py-2 rounded-[9px] transition-colors"
             >
-              Retry
+              {t("error.retry")}
             </button>
           </>
         ) : hasNextPage ? (
@@ -312,13 +392,15 @@ export default function TransactionExplorer({
             type="button"
             onClick={() => void loadMore()}
             disabled={loading}
-            className="bg-[#f6f5f8] border border-[#e5e3ea] enabled:hover:border-[#c4b5fd] disabled:opacity-50 font-semibold text-[13px] px-5 py-2 rounded-[9px] transition-colors"
+            className="bg-[var(--color-bg-raised)] border border-[var(--color-border-default)] enabled:hover:border-[var(--color-border-strong)] disabled:opacity-50 font-semibold text-[13px] px-5 py-2 rounded-[9px] transition-colors"
           >
-            {loading ? "Loading…" : "Load more"}
+            {loading ? t("explorer.loading") : t("explorer.loadMore")}
           </button>
         ) : (
           txs.length > 0 && (
-            <span className="text-[13px] text-[#c3c1cb]">End of results</span>
+            <span className="text-[13px] text-[var(--color-text-faint)]">
+              {t("explorer.endOfResults")}
+            </span>
           )
         )}
       </div>

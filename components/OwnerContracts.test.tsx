@@ -8,6 +8,11 @@ import type { ContractEvent } from '@/lib/types';
 import { ContractCallError } from '@/lib/sorobanTx';
 import OwnerContracts from './OwnerContracts';
 
+// The error branch renders `BackendUnavailable`, which reads the app router.
+vi.mock("next/navigation", () => ({
+  useRouter: () => ({ refresh: vi.fn(), replace: vi.fn(), push: vi.fn() }),
+}));
+
 const OWNER = 'GOWNERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
 const C1 = 'CCONTRACTAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
 const C2 = 'CCONTRACTBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB';
@@ -101,9 +106,11 @@ describe("OwnerContracts", () => {
 
     renderDashboard({ loadContracts });
 
-    expect(await screen.findByText("Registry simulation failed")).toBeTruthy();
+    expect((await screen.findByRole("alert")).textContent).toMatch(
+      /temporarily unavailable/i,
+    );
 
-    await userEvent.click(screen.getByRole("button", { name: /try again/i }));
+    await userEvent.click(screen.getByRole("button", { name: /retry/i }));
 
     await screen.findByText("My Protocol");
     expect(loadContracts).toHaveBeenCalledTimes(2);
@@ -148,7 +155,7 @@ describe("OwnerContracts", () => {
     );
 
     await waitFor(() => expect(screen.getByText("Deactivated")).toBeTruthy());
-    expect(deactivate).toHaveBeenCalledWith(C1, OWNER);
+    expect(deactivate).toHaveBeenCalledWith(C1, OWNER, expect.any(Function));
     // The parent is told, so the global "recently registered" list can refresh.
     expect(onChanged).toHaveBeenCalled();
     // And the row is not re-fetched from a registry that lags the ledger.
@@ -289,7 +296,7 @@ describe("OwnerContracts", () => {
     await userEvent.click(screen.getByRole("button", { name: /^stake$/i }));
 
     await waitFor(() =>
-      expect(stake).toHaveBeenCalledWith(C1, OWNER, BigInt(250)),
+      expect(stake).toHaveBeenCalledWith(C1, OWNER, BigInt(250), expect.any(Function)),
     );
   });
 
@@ -360,6 +367,6 @@ describe("OwnerContracts", () => {
     await waitFor(() => expect(button.hasAttribute("disabled")).toBe(false));
     await userEvent.click(button);
 
-    await waitFor(() => expect(withdraw).toHaveBeenCalledWith(C1, OWNER));
+    await waitFor(() => expect(withdraw).toHaveBeenCalledWith(C1, OWNER, expect.any(Function)));
   });
 });
